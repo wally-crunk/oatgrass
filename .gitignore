@@ -1,0 +1,91 @@
+# Bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+*.whl
+*.manifest
+*.spec
+
+# PyInstaller
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+.venv314/
+venv/
+ENV/
+env/
+env.bak/
+
+# Testing / Coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.hypothesis/
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+AGENTS/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local override config
+.local/
+*.log
+
+# Personal environments
+.venv314/
+local/
+pytest.ini
+.github/
+
+# Reference docs (large copy of original docs)
+reference/
+README.md
+sample-output.txt
+config.toml
+
+# Local-only folder for reference/testing artifacts
+reference/
+tests/
+
+# Basic mode run captures
+run*.txt
+
+# Sample output log
+sample-output.txt
+
+# Optional - If you're using secrets or keys
+*.pem
+*.key
+*.crt
+
+# Optional - AWS or cloud credentials
+.aws/
+.amazonq/

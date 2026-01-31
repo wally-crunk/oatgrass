@@ -1,0 +1,9 @@
+[trackers.red]
+name = "RED"
+url = "https://rxxxxxxx.xx"       # put the red url here
+api_key = ""
+
+[trackers.ops]
+name = "OPS"
+url = "https://oxxxxxx.xxxxxxx"   # put the ops url here
+api_key = ""
