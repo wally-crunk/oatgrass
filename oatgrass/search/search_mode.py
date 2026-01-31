@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from html import unescape
-from typing import Sequence, TextIO
+from typing import Sequence, TextIO, Optional
 from urllib.parse import parse_qs, urlparse
 
 from pathlib import Path
 
 import aiohttp
 from rich.console import Console
+from rich.text import Text
 
 from oatgrass.config import OatgrassConfig, TrackerConfig
 from oatgrass.search.gazelle_client import DEFAULT_USER_AGENT, GazelleServiceAdapter
@@ -18,10 +20,12 @@ from oatgrass.search.types import GazelleSearchResult
 console = Console()
 
 
-def _emit(message: str, log_handle: TextIO | None = None) -> None:
-    console.print(message)
+def _emit(message: str, log_handle: TextIO | None = None, indent: int = 0) -> None:
+    padding = " " * max(indent, 0)
+    console.print(f"{padding}{message}")
     if log_handle:
-        log_handle.write(f"{message}\n")
+        plain = Text.from_markup(message).plain
+        log_handle.write(f"{padding}{plain}\n")
 
 
 def _next_run_path() -> Path:
@@ -130,57 +134,86 @@ def _build_search_context(entry: dict) -> SearchContext:
     )
 
 
-def _context_with_unescaped(context: SearchContext) -> SearchContext:
+def _normalize_text(text: str) -> str:
+    """Aggressive normalization: strip punctuation, lowercase, remove extra spaces."""
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def _remove_stopwords(text: str) -> str:
+    """Remove common stopwords."""
+    words = text.split()
+    stopwords = {'the', 'a', 'an'}
+    return ' '.join(w for w in words if w not in stopwords)
+
+
+def _remove_volume_indicators(text: str) -> str:
+    """Remove volume indicators like 'vol 1', 'volume 2', 'vol i', etc."""
+    text = re.sub(r'\bvol(?:ume)?\s*[0-9ivxlcdm]+\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def _tier1_context(context: SearchContext) -> SearchContext:
+    """Tier 1: Exact match (as-is from source)."""
+    return context
+
+
+def _tier2_context(context: SearchContext) -> SearchContext:
+    """Tier 2: Light normalization - lowercase + HTML unescape + drop release_type/media."""
     return SearchContext(
-        artist=unescape(context.artist),
-        album=unescape(context.album) if context.album else None,
-        year=context.year,
-        release_type=context.release_type,
-        media=context.media,
-    )
-
-
-def _build_variations(context: SearchContext, loose: bool) -> list[SearchContext]:
-    candidates: list[SearchContext] = [context]
-    if not loose:
-        return candidates
-
-    unescaped = _context_with_unescaped(context)
-    if unescaped != context:
-        candidates.append(unescaped)
-
-    stripped = SearchContext(
-        artist=context.artist,
-        album=context.album,
+        artist=unescape(context.artist).lower(),
+        album=unescape(context.album).lower() if context.album else None,
         year=context.year,
         release_type=None,
         media=None,
     )
-    if stripped not in candidates:
-        candidates.append(stripped)
 
-    no_year = SearchContext(
-        artist=context.artist,
-        album=context.album,
+
+def _tier3_context(context: SearchContext) -> SearchContext:
+    """Tier 3: Aggressive normalization - strip punctuation + remove stopwords + remove volumes + drop year."""
+    artist = _normalize_text(unescape(context.artist))
+    artist = _remove_stopwords(artist)
+    
+    album = None
+    if context.album:
+        album = _normalize_text(unescape(context.album))
+        album = _remove_stopwords(album)
+        album = _remove_volume_indicators(album)
+    
+    return SearchContext(
+        artist=artist,
+        album=album,
         year=None,
-        release_type=stripped.release_type,
-        media=stripped.media,
+        release_type=None,
+        media=None,
     )
-    if no_year not in candidates:
-        candidates.append(no_year)
 
-    if unescaped != context:
-        unescaped_no_year = SearchContext(
-            artist=unescaped.artist,
-            album=unescaped.album,
-            year=None,
-            release_type=None,
-            media=None,
-        )
-        if unescaped_no_year not in candidates:
-            candidates.append(unescaped_no_year)
 
-    return candidates
+def _tier4_context(context: SearchContext) -> SearchContext:
+    """Tier 4: Colon cutoff - truncate album at first colon, then apply Tier 3 normalization."""
+    artist = _normalize_text(unescape(context.artist))
+    artist = _remove_stopwords(artist)
+    
+    album = None
+    if context.album:
+        # Cut off at first colon
+        album_text = unescape(context.album)
+        if ':' in album_text:
+            album_text = album_text.split(':', 1)[0].strip()
+        album = _normalize_text(album_text)
+        album = _remove_stopwords(album)
+        album = _remove_volume_indicators(album)
+    
+    return SearchContext(
+        artist=artist,
+        album=album,
+        year=None,
+        release_type=None,
+        media=None,
+    )
 
 
 def _group_id(entry: dict) -> int | None:
@@ -274,18 +307,54 @@ async def _fetch_torrent_group(tracker: TrackerConfig, group_id: int) -> dict:
             return await response.json()
 
 
-async def run_basic_mode(
+def _format_compact_result(
+    idx: int,
+    total: int,
+    source_tracker: TrackerConfig,
+    source_gid: int,
+    opposite_tracker: TrackerConfig,
+    target_gid: int | None,
+    source_max: int | None,
+    target_max: int | None,
+    tier_used: int = 1,
+    cross_upload_url: str | None = None,
+) -> str:
+    """Format a compact one-line result for abbreviated mode."""
+    source_name = source_tracker.name.upper()
+    target_name = opposite_tracker.name.upper()
+    tier_indicator = f"{tier_used}🔍" if tier_used > 1 else "="
+    
+    if target_gid is None:
+        return f"[Task {idx} of {total}] {tier_indicator} {source_name}={source_gid}; {target_name} not found; Explore {cross_upload_url}"
+    
+    if source_max is None or target_max is None:
+        return f"[Task {idx} of {total}] {tier_indicator} {source_name}={source_gid}; {target_name}={target_gid}; size unknown"
+    
+    if source_max == target_max:
+        return f"[Task {idx} of {total}] {tier_indicator} {source_name}={source_gid}; {target_name}={target_gid}; {_format_size(source_max)} (equal)"
+    
+    if source_max > target_max:
+        return f"[Task {idx} of {total}] {tier_indicator} {source_name}={source_gid}; {target_name}={target_gid}; {_format_size(source_max)} vs {_format_size(target_max)} (smaller)"
+    else:
+        return f"[Task {idx} of {total}] {tier_indicator} {source_name}={source_gid}; {target_name}={target_gid}; {_format_size(source_max)} vs {_format_size(target_max)} (larger)"
+
+
+async def run_search_mode(
     config: OatgrassConfig,
     target: str,
     tracker_key: str | None = None,
-    loose: bool = False,
+    strict: bool = False,
     log: bool = True,
+    abbrev: bool = False,
+    no_discogs: bool = False,
 ) -> None:
     collage_url = None
     entries: list[dict] = []
     source_key: str | None = None
     source_tracker: TrackerConfig | None = None
     opposite_tracker: TrackerConfig | None = None
+    discogs_service: Optional[object] = None
+    discogs_cache: dict[str, list[str]] = {}  # Cache artist variations
 
     parsed_url = None
     log_path: Path | None = None
@@ -352,25 +421,50 @@ async def run_basic_mode(
         _emit(f"Source input: {source_label}", log_handle)
         _emit(f"Source tracker: {source_tracker.name}", log_handle)
         _emit(f"Opposite tracker: {opposite_tracker.name}", log_handle)
-        _emit(f"Collage entries to process: {total}", log_handle)
+        if collage_url:
+            _emit(f"Collage entries to process: {total}", log_handle)
+        else:
+            _emit(f"Groups to process: {total}", log_handle)
 
         try:
             gazelle_client = GazelleServiceAdapter(opposite_tracker)
         except ValueError as exc:
             _emit(f"[red]Could not initialize Gazelle client:[/red] {exc}", log_handle)
             return
+        
+        # Initialize Discogs service if key is configured and not disabled
+        if config.api_keys.discogs_key and not no_discogs:
+            try:
+                from oatgrass.search.discogs_service import DiscogsService
+                discogs_service = DiscogsService(config.api_keys.discogs_key)
+            except Exception:
+                pass  # Silently skip if Discogs service fails to initialize
 
-        # main loop as before but replace console.print with _emit, using log_handle
+        cross_upload_candidates = []
+
         for idx, entry in enumerate(entries, start=1):
-            _emit(f"[Task {idx} of {total}]", log_handle)
             search_context = _build_search_context(entry)
-            params_desc = search_context.describe() or "none"
-            _emit(f"Derived search parameters: {params_desc}", log_handle)
+            
+            if not abbrev:
+                _emit(f"[Task {idx} of {total}]", log_handle)
 
-            candidates = _build_variations(search_context, loose)
+            # 4-tier search strategy (unless strict mode)
+            tiers = [_tier1_context] if strict else [_tier1_context, _tier2_context, _tier3_context, _tier4_context]
             hits = []
+            used_tier = 1
             used_context = search_context
-            for candidate in candidates:
+            
+            for tier_num, tier_func in enumerate(tiers, start=1):
+                candidate = tier_func(search_context)
+                
+                # Skip if same as previous tier
+                if tier_num > 1 and candidate.describe() == used_context.describe():
+                    if not abbrev:
+                        _emit(f"Tier {tier_num} search: (no further refinement)", log_handle, indent=3)
+                    continue
+                
+                if not abbrev:
+                    _emit(f"Tier {tier_num} search: {candidate.describe() or 'none'}", log_handle, indent=3)
                 hits = await gazelle_client.search(
                     candidate.artist,
                     album=candidate.album,
@@ -379,59 +473,133 @@ async def run_basic_mode(
                     media=candidate.media,
                 )
                 if hits:
+                    used_tier = tier_num
                     used_context = candidate
+                    if not abbrev:
+                        _emit(f"[green]Tier {tier_num} match found[/green]", log_handle, indent=3)
                     break
-            if used_context != search_context:
-                _emit(
-                    "[yellow]Fallback parameters applied: "
-                    f"{used_context.describe() or 'none'}[/yellow]",
-                    log_handle,
-                )
+                used_context = candidate
+            
+            # Tier 5: Discogs ANV fallback (only if Tiers 1-4 failed and Discogs is available)
+            if not hits and discogs_service and search_context.artist and search_context.album:
+                if not abbrev:
+                    _emit("Tier 5 Discogs search: querying artist variations", log_handle, indent=3)
+                
+                cache_key = f"{search_context.artist}|{search_context.album}"
+                
+                # Check cache first
+                if cache_key not in discogs_cache:
+                    try:
+                        artist_variations = await discogs_service.get_artist_variations(
+                            search_context.artist,
+                            search_context.album,
+                            search_context.year
+                        )
+                        discogs_cache[cache_key] = artist_variations
+                    except Exception:
+                        discogs_cache[cache_key] = []
+                
+                # Try each artist variation with Tier 3 normalization
+                for artist_variant in discogs_cache.get(cache_key, []):
+                    tier3_ctx = _tier3_context(SearchContext(
+                        artist=artist_variant,
+                        album=search_context.album,
+                        year=search_context.year,
+                        release_type=None,
+                        media=None
+                    ))
+                    if not abbrev:
+                        _emit(f"Tier 5 tracker search: {tier3_ctx.describe() or 'none'}", log_handle, indent=3)
+                    hits = await gazelle_client.search(
+                        tier3_ctx.artist,
+                        album=tier3_ctx.album,
+                        year=tier3_ctx.year
+                    )
+                    if hits:
+                        used_tier = 5
+                        used_context = tier3_ctx
+                        if not abbrev:
+                            _emit(f"[green]Tier 5 match found[/green]", log_handle, indent=3)
+                        break
+                    await asyncio.sleep(0.5)
 
+            source_gid = _group_id(entry)
+            collage_max = _collage_max_size(entry)
+            
             if not hits:
-                _emit(
-                    "[yellow]No matching group found on the opposite tracker.[/yellow]",
-                    log_handle,
-                )
-                gid = _group_id(entry)
-                if gid is not None:
-                    suggestion = _cross_upload_url(source_tracker, gid)
-                    _emit(
-                        "Suggestion:\n"
-                        f"  Explore {suggestion} for possible cross-upload to {opposite_tracker.name.upper()}",
-                        log_handle,
-                    )
-            else:
-                hit = hits[0]
-                collage_max = _collage_max_size(entry)
-                search_max = _extract_search_max(hit)
-                _emit(
-                    f"[Target, {opposite_tracker.name.upper()}] Found group: {hit.title} (ID {hit.group_id})",
-                    log_handle,
-                )
-                source_label = f"[Source, {source_tracker.name.upper()}] Collage max torrent size:"
-                source_size = _format_size(collage_max)
-                _emit(_display_value(source_label, source_size), log_handle)
-                target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
-                target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
-                target_size = _format_size(search_max)
-                _emit(_display_value(target_label, target_size), log_handle)
-
-                if collage_max is None or search_max is None:
-                    _emit("[yellow]Cannot determine max-size match (missing data).[/yellow]", log_handle)
-                elif collage_max == search_max:
-                    _emit(
-                        f"[Target, {opposite_tracker.name.upper()}] [green]Max size matches.[/green]",
-                        log_handle,
-                    )
+                if abbrev:
+                    if source_gid is not None:
+                        suggestion = _cross_upload_url(source_tracker, source_gid)
+                        cross_upload_candidates.append(suggestion)
+                        compact = _format_compact_result(
+                            idx, total, source_tracker, source_gid,
+                            opposite_tracker, None, collage_max, None, used_tier, suggestion
+                        )
+                        _emit(compact, log_handle)
                 else:
                     _emit(
-                        f"[Target, {opposite_tracker.name.upper()}] [magenta]Max size mismatch.[/magenta]",
+                        "[yellow]No matching group found on the opposite tracker.[/yellow]",
                         log_handle,
+                        indent=3,
                     )
+                    if source_gid is not None:
+                        suggestion = _cross_upload_url(source_tracker, source_gid)
+                        cross_upload_candidates.append(suggestion)
+                        _emit("Suggestion:", log_handle, indent=3)
+                        _emit(
+                            f"  Explore {suggestion} for possible cross-upload to {opposite_tracker.name.upper()}",
+                            log_handle,
+                            indent=3,
+                        )
+            else:
+                hit = hits[0]
+                search_max = _extract_search_max(hit)
+                
+                if abbrev:
+                    compact = _format_compact_result(
+                        idx, total, source_tracker, source_gid or 0,
+                        opposite_tracker, hit.group_id, collage_max, search_max, used_tier
+                    )
+                    _emit(compact, log_handle)
+                else:
+                    _emit(
+                        f"[Target, {opposite_tracker.name.upper()}] Found group: {hit.title} (ID {hit.group_id})",
+                        log_handle,
+                        indent=3,
+                    )
+                    source_label = f"[Source, {source_tracker.name.upper()}] Collage max torrent size:"
+                    source_size = _format_size(collage_max)
+                    _emit(_display_value(source_label, source_size), log_handle, indent=3)
+                    target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
+                    target_size = _format_size(search_max)
+                    _emit(_display_value(target_label, target_size), log_handle, indent=3)
+
+                    if collage_max is None or search_max is None:
+                        _emit("[yellow]Cannot determine max-size match (missing data).[/yellow]", log_handle, indent=3)
+                    elif collage_max == search_max:
+                        _emit(
+                            f"[Target, {opposite_tracker.name.upper()}] [green]Max size matches.[/green]",
+                            log_handle,
+                            indent=3,
+                        )
+                    else:
+                        _emit(
+                            f"[Target, {opposite_tracker.name.upper()}] [magenta]Max size mismatch.[/magenta]",
+                            log_handle,
+                            indent=3,
+                        )
 
             if idx < total:
                 await asyncio.sleep(0.005)
+
+        if cross_upload_candidates:
+            _emit("\n[End of Run]", log_handle)
+            _emit("  Explore the following for possible upload:", log_handle)
+            for url in cross_upload_candidates:
+                _emit(f"  {url}", log_handle)
+        elif entries:
+            _emit("\n[End of Run]", log_handle)
+            _emit("  No cross-upload candidates found.", log_handle)
     finally:
         if log_handle:
             _emit(f"[cyan][INFO][/cyan] Output mirrored to {log_path}", log_handle)

@@ -5,6 +5,7 @@ config.py - Simplified configuration model for Oatgrass
 from pathlib import Path
 from typing import Dict, Optional
 from pydantic import BaseModel, Field
+from rich.console import Console
 import sys
 
 try:
@@ -12,9 +13,11 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
+console = Console()
+
 
 class APIKeysConfig(BaseModel):
-    pass
+    discogs_key: str = ""
 
 class FuzzySearchConfig(BaseModel):
     """Parameters that control the fuzzy search heuristics."""
@@ -50,8 +53,8 @@ def load_config(config_path: Path) -> OatgrassConfig:
     """Load configuration from TOML file"""
     
     if not config_path.exists():
-        print(f"Configuration file not found: {config_path}")
-        print("Please create config.toml with your API keys")
+        console.print(f"[red][ERROR][/red] Configuration file not found: {config_path}")
+        console.print("Please create config.toml with your API keys")
         sys.exit(1)
     
     try:
@@ -72,5 +75,5 @@ def load_config(config_path: Path) -> OatgrassConfig:
         return config
         
     except Exception as e:
-        print(f"Error loading configuration: {e}")
+        console.print(f"[red][ERROR][/red] Error loading configuration: {e}")
         sys.exit(1)

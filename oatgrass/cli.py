@@ -16,7 +16,7 @@ try:
     import oatgrass as pkg
     from .config import OatgrassConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
-    from .search.basic_mode import run_basic_mode
+    from .search.search_mode import run_search_mode
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install required dependencies: pip install -r requirements.txt")
@@ -68,7 +68,7 @@ def main_menu(config: OatgrassConfig):
     console.print()
     display_config_table(config)
     console.print("[V] Verify API Keys")
-    console.print("[B] Basic mode")
+    console.print("[B] Search mode")
     console.print("[Q] Quit")
     console.print()
 
@@ -77,13 +77,13 @@ def main_menu(config: OatgrassConfig):
         asyncio.run(verify_api_keys(config))
         console.print("[cyan][INFO][/cyan] Verification complete. Goodbye!")
     elif choice == "B":
-        basic_mode_target = Prompt.ask("Collage or group URL/ID").strip()
-        loose_choice = Prompt.ask("Use loose fallback heuristics? (Y/n)", default="Y").strip().lower()
+        search_mode_target = Prompt.ask("Collage or group URL/ID").strip()
+        strict_choice = Prompt.ask("Use strict exact-match only? (y/N)", default="N").strip().lower()
         tracker_choice = Prompt.ask("Optional tracker key override (red/ops or enter to auto)", default="").strip().lower()
-        loose = loose_choice not in ("n", "no")
+        strict = strict_choice in ("y", "yes")
         tracker_key = tracker_choice or None
-        asyncio.run(run_basic_mode(config, basic_mode_target, tracker_key=tracker_key, loose=loose))
-        console.print("[cyan][INFO][/cyan] Basic mode run complete. Goodbye!")
+        asyncio.run(run_search_mode(config, search_mode_target, tracker_key=tracker_key, strict=strict))
+        console.print("[cyan][INFO][/cyan] Search mode run complete. Goodbye!")
     else:
         console.print("[cyan][INFO][/cyan] Goodbye!")
 
@@ -95,27 +95,38 @@ def show_help():
     \"Find candidates for cross-uploading\"
 
 USAGE:
-    oatgrass [OPTIONS]
-    python -m oatgrass [OPTIONS]
+    oatgrass [OPTIONS] [URL_OR_ID]
+    python -m oatgrass [OPTIONS] [URL_OR_ID]
+
+ARGUMENTS:
+    URL_OR_ID         Collage URL or group URL to process
 
 OPTIONS:
     -h, --help        Show this help message and exit
     -v, --verify      Verify keys and exit (non-interactive)
-    --getsimple URL   Compare the first collage entry against the opposite tracker and report max-size match
-    --get URL         Same as --getsimple but retries with relaxed parameters (unescaped text + no releasetype/media)
+    -a, --abbrev      Abbreviated output (one line per task)
     -c, --config PATH Path to config.toml (file or directory)
+    --strict          Use strict exact-match search only (default: 5-tier search)
+    --no-discogs      Disable Discogs artist name variation fallback (Tier 5)
+
+SEARCH MODES:
+    Regular (default): 5-tier search strategy for best match rate
+      - Tier 1: Exact match
+      - Tier 2: Light normalization (lowercase, HTML unescape)
+      - Tier 3: Aggressive normalization (strip punctuation, remove stopwords)
+      - Tier 4: Colon cutoff (truncate at first colon for subtitle handling)
+      - Tier 5: Discogs ANV fallback (artist name variations, requires Discogs API key)
+    
+    Strict (--strict): Exact match only, no normalization
+
+EXAMPLES:
+    oatgrass https://red.foo/collages.php?id=12345
+    oatgrass -a https://ops.bar/torrents.php?id=67890
+    oatgrass --strict https://red.foo/torrents.php?id=1234567
 
 CONFIGURATION:
-    Config is only read from:
-      1) --config PATH (file or directory)
-      2) current working directory (./config.toml)
-      3) source repo root (next to this package when running from a checkout)
-    This tool intentionally avoids ~/.config or other global locations.
-    Add API keys for:
-    • Metadata: Discogs
-    • Gazelle Trackers: RED, OPS
-    Add/confirm the URLs for:
-    • Gazelle Trackers: RED, OPS
+    Requires config.toml with API keys for RED, OPS, and optionally Discogs.
+    Searched in: --config PATH, ./config.toml, or repo root.
 
 EXIT CODES:
     0    Success (all configured keys valid)
@@ -129,9 +140,11 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-h', '--help', action='store_true', help='Show help')
     parser.add_argument('-v', '--verify', action='store_true', help='Verify keys and exit')
+    parser.add_argument('-a', '--abbrev', action='store_true', help='Abbreviated output for search mode')
+    parser.add_argument('--strict', action='store_true', help='Use strict exact-match search only')
+    parser.add_argument('--no-discogs', action='store_true', help='Disable Discogs artist name variation fallback')
     parser.add_argument('-c', '--config', metavar='PATH', help='Path to config.toml (file or directory)')
-    parser.add_argument('--getstrict', metavar='URL', dest='basic_mode_target', help='Compare the first collage entry against the opposite tracker (basic mode)')
-    parser.add_argument('--get', metavar='URL', dest='basic_mode_target_more', help='Invoke basic mode with fallback heuristics (unescaped titles & no releasetype/media)')
+    parser.add_argument('target', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
         args = parser.parse_args()
@@ -164,20 +177,15 @@ def main():
 
         config_path = resolve_config_path(args.config)
         config = load_config(config_path)
-        if args.basic_mode_target_more:
+        
+        if args.target:
             asyncio.run(
-                run_basic_mode(
+                run_search_mode(
                     config,
-                    args.basic_mode_target_more,
-                    loose=True,
-                )
-            )
-            sys.exit(0)
-        if args.basic_mode_target:
-            asyncio.run(
-                run_basic_mode(
-                    config,
-                    args.basic_mode_target,
+                    args.target,
+                    strict=args.strict,
+                    abbrev=args.abbrev,
+                    no_discogs=args.no_discogs,
                 )
             )
             sys.exit(0)

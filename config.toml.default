@@ -1,9 +1,12 @@
+[api_keys]
+discogs_key = ""     # your key here (optional, for Tier 5 artist name variation fallback)
+
 [trackers.red]
 name = "RED"
-url = "https://rxxxxxxx.xx"       # put the red url here
+url = "https://rxxxxxxx.xx"       # type the red url here
 api_key = ""
 
 [trackers.ops]
 name = "OPS"
-url = "https://oxxxxxx.xxxxxxx"   # put the ops url here
+url = "https://oxxxxxx.xxxxxxx"   # type the ops url here
 api_key = ""

@@ -23,7 +23,6 @@ pip-delete-this-directory.txt
 
 # Virtual environments
 .venv/
-.venv314/
 venv/
 ENV/
 env/
@@ -48,7 +47,9 @@ htmlcov/
 .idea/
 *.sublime-project
 *.sublime-workspace
-AGENTS/
+
+# CI/CD
+.github/
 
 # OS / misc
 .DS_Store
@@ -57,29 +58,33 @@ desktop.ini
 
 # Local override config
 .local/
-*.log
-
-# Personal environments
-.venv314/
-local/
-pytest.ini
-.github/
-
-# Reference docs (large copy of original docs)
-reference/
-README.md
-sample-output.txt
 config.toml
 
-# Local-only folder for reference/testing artifacts
+# Personal environments and ephemera
+.venv*/
+**/local/
+**/docs/
+**/output/
+**/private/
+**/temp/
+**/tmp/
+**/tests/
+
+# Reference docs and samples
 reference/
+**/reference/
+**/ref/
+**/samples/
+*.sample
+sample-*
+
+# Tests
 tests/
 
-# Basic mode run captures
+# Output logs and captures
 run*.txt
-
-# Sample output log
-sample-output.txt
+output*.txt
+*.log
 
 # Optional - If you're using secrets or keys
 *.pem

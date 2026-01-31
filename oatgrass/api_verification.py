@@ -20,6 +20,28 @@ def _invalid_key_msg(detail: str) -> str:
     return f"Invalid API key - {detail}"
 
 
+async def verify_discogs(session, api_key: str, timeout=10):
+    """Verify Discogs API key and get username"""
+    headers = {
+        'Authorization': f'Discogs token={api_key}',
+        'User-Agent': UA,
+    }
+    api_url = "https://api.discogs.com/oauth/identity"
+    
+    async with session.get(
+        api_url,
+        headers=headers,
+        timeout=timeout
+    ) as response:
+        if response.status != 200:
+            return "Discogs", False, _invalid_key_msg(f"{response.status} {response.reason}")
+        
+        data = await response.json()
+        if 'username' in data and 'id' in data:
+            return "Discogs", True, f"Hello {data['username']} (ID: {data['id']})"
+        return "Discogs", False, _invalid_key_msg("no user details found")
+
+
 async def verify_gazelle_tracker(session, api_key: str, url: str, name: str, timeout=10):
     """Verify Gazelle tracker (RED/OPS) API key and get username"""
     headers = {
@@ -45,8 +67,9 @@ async def verify_gazelle_tracker(session, api_key: str, url: str, name: str, tim
 
 
 # Service lookup table: key_name -> (verify_function, display_name)
-API_SERVICES = {}
-
+API_SERVICES = {
+    'discogs_key': (verify_discogs, 'Discogs'),
+}
 
 async def verify_with_retry(verify_func, service_name, *args, max_retries=2, timeout=10):
     """Wrapper to add retry logic with exponential backoff"""
