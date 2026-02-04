@@ -8,11 +8,13 @@ from typing import Optional
 
 import aiohttp
 
+from oatgrass.__version__ import __version__
+
 
 class DiscogsService:
     """Minimal Discogs client for artist ANV lookups."""
     
-    def __init__(self, token: str, user_agent: str = "Oatgrass/0.0.1"):
+    def __init__(self, token: str, user_agent: str = f"Oatgrass/{__version__}"):
         self.token = token
         self.user_agent = user_agent
         self.base_url = "https://api.discogs.com"

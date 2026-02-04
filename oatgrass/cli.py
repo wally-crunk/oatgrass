@@ -17,6 +17,15 @@ try:
     from .config import OatgrassConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
     from .search.search_mode import run_search_mode
+    
+    # Check for scipy (required for Hungarian algorithm in edition matching)
+    try:
+        import scipy
+    except ImportError:
+        print("Error: scipy is required for edition matching (Hungarian algorithm)")
+        print("Please install: pip install scipy")
+        print("Or activate venv: source venv/bin/activate")
+        sys.exit(1)
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install required dependencies: pip install -r requirements.txt")
@@ -68,7 +77,7 @@ def main_menu(config: OatgrassConfig):
     console.print()
     display_config_table(config)
     console.print("[V] Verify API Keys")
-    console.print("[B] Search mode")
+    console.print("[S] Search mode")
     console.print("[Q] Quit")
     console.print()
 
@@ -76,13 +85,57 @@ def main_menu(config: OatgrassConfig):
     if choice == "V":
         asyncio.run(verify_api_keys(config))
         console.print("[cyan][INFO][/cyan] Verification complete. Goodbye!")
-    elif choice == "B":
+    elif choice == "S":
+        # Prompt for URL/ID
         search_mode_target = Prompt.ask("Collage or group URL/ID").strip()
-        strict_choice = Prompt.ask("Use strict exact-match only? (y/N)", default="N").strip().lower()
-        tracker_choice = Prompt.ask("Optional tracker key override (red/ops or enter to auto)", default="").strip().lower()
-        strict = strict_choice in ("y", "yes")
-        tracker_key = tracker_choice or None
-        asyncio.run(run_search_mode(config, search_mode_target, tracker_key=tracker_key, strict=strict))
+        
+        # If bare ID, prompt for source tracker
+        tracker_key = None
+        if not (search_mode_target.startswith("http://") or search_mode_target.startswith("https://")):
+            console.print("\nSource tracker (for bare ID):")
+            console.print("  [R] RED (default)")
+            console.print("  [O] OPS")
+            tracker_choice = Prompt.ask("Source tracker", default="R").strip().upper()
+            tracker_key = "ops" if tracker_choice == "O" else "red"
+        
+        # Prompt for output mode
+        console.print("\nOutput mode:")
+        console.print("  [A] Abbreviated - One line per group")
+        console.print("  [N] Normal (default) - Album matching + brief candidate summary")
+        console.print("  [V] Verbose - Full edition details, confidence scores")
+        console.print("  [D] Debug - API calls, JSON responses, timestamps")
+        output_choice = Prompt.ask("Output mode", default="N").strip().upper()
+        abbrev = output_choice == "A"
+        verbose = output_choice == "V"
+        debug = output_choice == "D"
+        
+        # Prompt for matching mode
+        console.print("\nMatching mode:")
+        console.print("  [E] Edition-aware (default) - Match at edition/media/encoding level")
+        console.print("  [G] Group-only - Stop when group is found")
+        matching_choice = Prompt.ask("Matching mode", default="E").strip().upper()
+        basic = matching_choice == "G"
+        
+        # Prompt for fallback mode
+        console.print("\nFallback mode:")
+        console.print("  [F] Full 5-tier search (default) - Exact + normalization + Discogs")
+        console.print("  [D] Disable Discogs (4-tier) - Skip artist name variations")
+        console.print("  [X] Exact match only (1-tier) - Fastest, may miss matches")
+        fallback_choice = Prompt.ask("Fallback mode", default="F").strip().upper()
+        no_fallback = fallback_choice == "X"
+        no_discogs = fallback_choice == "D" or (fallback_choice == "F" and not config.api_keys.discogs_key)
+        
+        asyncio.run(run_search_mode(
+            config, 
+            search_mode_target,
+            tracker_key=tracker_key,
+            strict=no_fallback,
+            abbrev=abbrev,
+            verbose=verbose,
+            debug=debug,
+            basic=basic,
+            no_discogs=no_discogs,
+        ))
         console.print("[cyan][INFO][/cyan] Search mode run complete. Goodbye!")
     else:
         console.print("[cyan][INFO][/cyan] Goodbye!")
@@ -103,33 +156,56 @@ ARGUMENTS:
 
 OPTIONS:
     -h, --help        Show this help message and exit
-    -v, --verify      Verify keys and exit (non-interactive)
-    -a, --abbrev      Abbreviated output (one line per task)
+    --verify          Verify keys and exit (non-interactive)
     -c, --config PATH Path to config.toml (file or directory)
-    --strict          Use strict exact-match search only (default: 5-tier search)
-    --no-discogs      Disable Discogs artist name variation fallback (Tier 5)
+    -o, --output DIR  Output directory for run logs (default: ./output)
 
-SEARCH MODES:
-    Regular (default): 5-tier search strategy for best match rate
-      - Tier 1: Exact match
-      - Tier 2: Light normalization (lowercase, HTML unescape)
-      - Tier 3: Aggressive normalization (strip punctuation, remove stopwords)
-      - Tier 4: Colon cutoff (truncate at first colon for subtitle handling)
-      - Tier 5: Discogs ANV fallback (artist name variations, requires Discogs API key)
-    
-    Strict (--strict): Exact match only, no normalization
+Output modes:
+    -a, --abbrev      Abbreviated output (one line per group)
+    -n, --normal      Normal output mode (default)
+    -v, --verbose     Verbose output with full edition details
+    -d, --debug       Debug mode with API calls, JSON responses, timestamps
+
+Matching modes:
+  --search-editions   Search at edition level (default)
+        · Matches editions by year, title, label, catalog (fuzzy matching)
+        · Compares individual torrents within matched editions
+        · Finds missing encodings (e.g., WEB 24bit FLAC on source but not target)
+        · Ignores lossy formats when lossless exists
+        → Fewer false positives, requires some review
+
+  --search-groups     Search at group level (ignore editions)
+        · No edition or encoding analysis
+        → More false positives, requires more review
+
+Fallback modes:
+  --no-discogs        Disable Discogs artist name variation (disable tier 5)
+        · Faster results
+        · Automatically chosen if no Discogs key is available
+
+  --no-fallback       No fallback tiers, exact match only (disable tiers 2-5)
+        · Fastest results
+        · Will miss groups that are slightly spelled differently between trackers
+
+SEARCH STRATEGY (5-tier default):
+    Tier 1: Exact match
+    Tier 2: Light normalization (lowercase, HTML unescape)
+    Tier 3: Aggressive normalization (strip punctuation, remove stopwords)
+    Tier 4: Colon cutoff (truncate at first colon)
+    Tier 5: Discogs ANV fallback (artist name variations, requires API key)
 
 EXAMPLES:
     oatgrass https://red.foo/collages.php?id=12345
-    oatgrass -a https://ops.bar/torrents.php?id=67890
-    oatgrass --strict https://red.foo/torrents.php?id=1234567
+    oatgrass -v https://red.foo/torrents.php?id=67890
+    oatgrass -a https://ops.bar/collages.php?id=999
+    oatgrass --verify
 
 CONFIGURATION:
     Requires config.toml with API keys for RED, OPS, and optionally Discogs.
     Searched in: --config PATH, ./config.toml, or repo root.
 
 EXIT CODES:
-    0    Success (all configured keys valid)
+    0    Success
     1    Failure (missing config, invalid keys, or error)
 """
     print(help_text)
@@ -139,12 +215,18 @@ def main():
     """Entry point"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-h', '--help', action='store_true', help='Show help')
-    parser.add_argument('-v', '--verify', action='store_true', help='Verify keys and exit')
-    parser.add_argument('-a', '--abbrev', action='store_true', help='Abbreviated output for search mode')
-    parser.add_argument('--strict', action='store_true', help='Use strict exact-match search only')
-    parser.add_argument('--no-discogs', action='store_true', help='Disable Discogs artist name variation fallback')
+    parser.add_argument('--verify', action='store_true', help='Verify keys and exit')
     parser.add_argument('-c', '--config', metavar='PATH', help='Path to config.toml (file or directory)')
-    parser.add_argument('target', nargs='?', help='Collage URL, group URL, or group ID')
+    parser.add_argument('-o', '--output', metavar='DIR', help='Output directory for run logs (default: ./output)')
+    parser.add_argument('-a', '--abbrev', action='store_true', help='Abbreviated output for search mode')
+    parser.add_argument('-n', '--normal', action='store_true', help='Normal output mode (default)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output with full edition details')
+    parser.add_argument('-d', '--debug', action='store_true', help='Debug mode with API calls, JSON responses, timestamps')
+    parser.add_argument('--search-editions', action='store_true', help='Search at edition level (default)')
+    parser.add_argument('--search-groups', action='store_true', help='Search at group level (ignore editions)')
+    parser.add_argument('--no-discogs', action='store_true', help='Disable Discogs artist name variation (disable tier 5)')
+    parser.add_argument('--no-fallback', action='store_true', help='No fallback tiers, exact match only (disable tiers 2-5)')
+    parser.add_argument('url_or_id', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
         args = parser.parse_args()
@@ -178,14 +260,28 @@ def main():
         config_path = resolve_config_path(args.config)
         config = load_config(config_path)
         
-        if args.target:
+        if args.url_or_id:
+            # Check for conflicting flags
+            if sum([args.abbrev, args.verbose, args.debug]) > 1:
+                console.print("[red][ERROR][/red] Cannot use multiple output modes (--abbrev, --verbose, --debug)")
+                sys.exit(1)
+            if args.search_editions and args.search_groups:
+                console.print("[red][ERROR][/red] Cannot use both --search-editions and --search-groups")
+                sys.exit(1)
+            
+            output_dir = Path(args.output).expanduser() if args.output else Path("output")
+            
             asyncio.run(
                 run_search_mode(
                     config,
-                    args.target,
-                    strict=args.strict,
+                    args.url_or_id,
+                    strict=args.no_fallback,
                     abbrev=args.abbrev,
+                    verbose=args.verbose,
+                    debug=args.debug,
+                    basic=args.search_groups,
                     no_discogs=args.no_discogs,
+                    output_dir=output_dir,
                 )
             )
             sys.exit(0)

@@ -16,25 +16,33 @@ from rich.text import Text
 from oatgrass.config import OatgrassConfig, TrackerConfig
 from oatgrass.search.gazelle_client import DEFAULT_USER_AGENT, GazelleServiceAdapter
 from oatgrass.search.types import GazelleSearchResult
+from oatgrass import logger
 
 console = Console()
 
 
-def _emit(message: str, log_handle: TextIO | None = None, indent: int = 0) -> None:
+def _emit(message: str, indent: int = 0) -> None:
+    """Emit message to screen and log file via logger"""
     padding = " " * max(indent, 0)
-    console.print(f"{padding}{message}")
-    if log_handle:
-        plain = Text.from_markup(message).plain
-        log_handle.write(f"{padding}{plain}\n")
+    # Use logger for immediate output
+    plain = Text.from_markup(message).plain
+    logger.log(f"{padding}{plain}")
 
 
-def _next_run_path() -> Path:
-    idx = 1
-    while True:
-        candidate = Path(f"run{idx}.txt")
-        if not candidate.exists():
-            return candidate
-        idx += 1
+def _next_run_path(output_dir: Path = Path(".")) -> Path:
+    """Find next available runN.txt path in output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find highest existing run number
+    max_num = 0
+    for path in output_dir.glob("run*.txt"):
+        try:
+            num = int(path.stem[3:])  # Extract number from "runN"
+            max_num = max(max_num, num)
+        except (ValueError, IndexError):
+            pass
+    
+    return output_dir / f"run{max_num + 1}.txt"
 
 
 @dataclass
@@ -157,8 +165,14 @@ def _remove_volume_indicators(text: str) -> str:
 
 
 def _tier1_context(context: SearchContext) -> SearchContext:
-    """Tier 1: Exact match (as-is from source)."""
-    return context
+    """Tier 1: Exact match - artist/album/year only (drop media/release_type)."""
+    return SearchContext(
+        artist=context.artist,
+        album=context.album,
+        year=context.year,
+        release_type=None,
+        media=None,
+    )
 
 
 def _tier2_context(context: SearchContext) -> SearchContext:
@@ -346,8 +360,22 @@ async def run_search_mode(
     strict: bool = False,
     log: bool = True,
     abbrev: bool = False,
+    verbose: bool = False,
+    debug: bool = False,
+    basic: bool = False,
     no_discogs: bool = False,
+    output_dir: Path | None = None,
 ) -> None:
+    # Initialize logger with debug mode
+    log_path: Path | None = None
+    if log:
+        out_dir = output_dir or Path("output")
+        log_path = _next_run_path(out_dir)
+        log_instance = logger.OatgrassLogger(log_path, debug=debug)
+        logger.set_logger(log_instance)
+    else:
+        logger.set_logger(logger.OatgrassLogger(debug=debug))
+    
     collage_url = None
     entries: list[dict] = []
     source_key: str | None = None
@@ -357,11 +385,6 @@ async def run_search_mode(
     discogs_cache: dict[str, list[str]] = {}  # Cache artist variations
 
     parsed_url = None
-    log_path: Path | None = None
-    log_handle: TextIO | None = None
-    if log:
-        log_path = _next_run_path()
-        log_handle = log_path.open("w", encoding="utf-8")
 
     try:
         try:
@@ -372,8 +395,7 @@ async def run_search_mode(
                     if not group_id_candidates:
                         raise ValueError("Group URL must include an id parameter")
                     group_id = int(group_id_candidates[0])
-                    source_key = tracker_key or "red"
-                    source_tracker = _resolve_tracker_by_key(config.trackers, source_key)
+                    source_key, source_tracker = _find_tracker_by_url(config.trackers, target)
                     _, opposite_tracker = _pick_opposite_tracker(config.trackers, source_key)
                     group_response = await _fetch_torrent_group(source_tracker, group_id)
                     resp = group_response.get("response", {})
@@ -401,35 +423,38 @@ async def run_search_mode(
                 torrents = resp.get("torrents") or resp.get("torrent") or []
                 entries = [{"group": group, "torrents": torrents}]
         except ValueError as exc:
-            _emit(f"[red]{exc}[/red]", log_handle)
+            _emit(f"[red]{exc}[/red]")
             return
         except Exception as exc:  # pragma: no cover
-            _emit(f"[red]Failed to load entries:[/red] {exc}", log_handle)
+            _emit(f"[red]Failed to load entries:[/red] {exc}")
             return
 
         if not entries:
-            _emit("[yellow]No entries found for the provided input.[/yellow]", log_handle)
+            _emit("[yellow]No entries found for the provided input.[/yellow]")
             return
 
         if not source_tracker or not opposite_tracker:
-            _emit("[red]Tracker configuration is incomplete.[/red]", log_handle)
+            _emit("[red]Tracker configuration is incomplete.[/red]")
             return
 
         total = len(entries)
         source_label = collage_url or f"group {target}"
-        _emit("[bold]Search mode: find cross-upload candidates[/bold]", log_handle)
-        _emit(f"Source input: {source_label}", log_handle)
-        _emit(f"Source tracker: {source_tracker.name}", log_handle)
-        _emit(f"Opposite tracker: {opposite_tracker.name}", log_handle)
+        _emit("[bold]Search mode: find cross-upload candidates[/bold]")
+        _emit(f"Source input: {source_label}")
+        _emit(f"Source tracker: {source_tracker.name}")
+        _emit(f"Opposite tracker: {opposite_tracker.name}")
         if collage_url:
-            _emit(f"Collage entries to process: {total}", log_handle)
+            _emit(f"Collage entries to process: {total}")
         else:
-            _emit(f"Groups to process: {total}", log_handle)
+            _emit(f"Groups to process: {total}")
+        if abbrev:
+            _emit("Abbrev mode - will not report when album matches & no candidates found")
 
         try:
             gazelle_client = GazelleServiceAdapter(opposite_tracker)
+            source_client = GazelleServiceAdapter(source_tracker)
         except ValueError as exc:
-            _emit(f"[red]Could not initialize Gazelle client:[/red] {exc}", log_handle)
+            _emit(f"[red]Could not initialize Gazelle client:[/red] {exc}")
             return
         
         # Initialize Discogs service if key is configured and not disabled
@@ -437,20 +462,20 @@ async def run_search_mode(
             try:
                 from oatgrass.search.discogs_service import DiscogsService
                 discogs_service = DiscogsService(config.api_keys.discogs_key)
-            except Exception:
-                pass  # Silently skip if Discogs service fails to initialize
+            except Exception as e:
+                _emit(f"[yellow]Warning: Discogs initialization failed: {e}. Tier 5 search will be skipped.[/yellow]")
 
-        cross_upload_candidates = []
+        cross_upload_candidates = []  # List of (url, priority) tuples
 
         for idx, entry in enumerate(entries, start=1):
             search_context = _build_search_context(entry)
             
             if not abbrev:
-                _emit(f"[Task {idx} of {total}]", log_handle)
+                _emit(f"[Task {idx} of {total}]")
 
             # 4-tier search strategy (unless strict mode)
             tiers = [_tier1_context] if strict else [_tier1_context, _tier2_context, _tier3_context, _tier4_context]
-            hits = []
+            results_list = []
             used_tier = 1
             used_context = search_context
             
@@ -460,30 +485,38 @@ async def run_search_mode(
                 # Skip if same as previous tier
                 if tier_num > 1 and candidate.describe() == used_context.describe():
                     if not abbrev:
-                        _emit(f"Tier {tier_num} search: (no further refinement)", log_handle, indent=3)
+                        _emit(f"Tier {tier_num} search: (no further refinement)", indent=3)
                     continue
                 
                 if not abbrev:
-                    _emit(f"Tier {tier_num} search: {candidate.describe() or 'none'}", log_handle, indent=3)
-                hits = await gazelle_client.search(
+                    _emit(f"Tier {tier_num} search: {candidate.describe() or 'none'}", indent=3)
+                
+                logger.get_logger().debug(f"Tier {tier_num} API call: {candidate.describe()}")
+                
+                response = await gazelle_client.search(
                     candidate.artist,
                     album=candidate.album,
                     year=candidate.year,
                     release_type=candidate.release_type,
                     media=candidate.media,
                 )
-                if hits:
+                # Extract results list from API response
+                results_list = response.get('response', {}).get('results', []) if isinstance(response, dict) else []
+                # Map to GazelleSearchResult objects
+                if results_list:
+                    results_list = [gazelle_client._map_result(r) for r in results_list]
+                if results_list:
                     used_tier = tier_num
                     used_context = candidate
                     if not abbrev:
-                        _emit(f"[green]Tier {tier_num} match found[/green]", log_handle, indent=3)
+                        _emit(f"[green]Tier {tier_num} match found[/green]", indent=3)
                     break
                 used_context = candidate
             
             # Tier 5: Discogs ANV fallback (only if Tiers 1-4 failed and Discogs is available)
-            if not hits and discogs_service and search_context.artist and search_context.album:
+            if not results_list and discogs_service and search_context.artist and search_context.album:
                 if not abbrev:
-                    _emit("Tier 5 Discogs search: querying artist variations", log_handle, indent=3)
+                    _emit("Tier 5 Discogs search: querying artist variations", indent=3)
                 
                 cache_key = f"{search_context.artist}|{search_context.album}"
                 
@@ -509,50 +542,71 @@ async def run_search_mode(
                         media=None
                     ))
                     if not abbrev:
-                        _emit(f"Tier 5 tracker search: {tier3_ctx.describe() or 'none'}", log_handle, indent=3)
-                    hits = await gazelle_client.search(
+                        _emit(f"Tier 5 tracker search: {tier3_ctx.describe() or 'none'}", indent=3)
+                    response = await gazelle_client.search(
                         tier3_ctx.artist,
                         album=tier3_ctx.album,
                         year=tier3_ctx.year
                     )
-                    if hits:
+                    results_list = response.get('response', {}).get('results', []) if isinstance(response, dict) else []
+                    if results_list:
+                        results_list = [gazelle_client._map_result(r) for r in results_list]
+                    if results_list:
                         used_tier = 5
                         used_context = tier3_ctx
                         if not abbrev:
-                            _emit(f"[green]Tier 5 match found[/green]", log_handle, indent=3)
+                            _emit(f"[green]Tier 5 match found[/green]", indent=3)
                         break
                     await asyncio.sleep(0.5)
 
             source_gid = _group_id(entry)
             collage_max = _collage_max_size(entry)
             
-            if not hits:
+            # Edition-aware processing (unless --basic flag is set)
+            if not basic and results_list and source_gid:
+                from oatgrass.search.edition_aware_mode import process_entry_edition_aware
+                try:
+                    target_gid, edition_candidates = await process_entry_edition_aware(
+                        entry, source_tracker, opposite_tracker,
+                        source_client, gazelle_client,
+                        _emit, abbrev, verbose
+                    )
+                    if edition_candidates:
+                        cross_upload_candidates.extend(edition_candidates)
+                    if idx < total:
+                        await asyncio.sleep(0.005)
+                    continue
+                except Exception as e:
+                    if not abbrev:
+                        _emit(f"[yellow]Edition-aware processing failed: {e}. Falling back to basic mode.[/yellow]", indent=3)
+            
+            # Basic mode processing (original logic)
+            
+            if not results_list:
                 if abbrev:
                     if source_gid is not None:
                         suggestion = _cross_upload_url(source_tracker, source_gid)
-                        cross_upload_candidates.append(suggestion)
+                        cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
                         compact = _format_compact_result(
                             idx, total, source_tracker, source_gid,
                             opposite_tracker, None, collage_max, None, used_tier, suggestion
                         )
-                        _emit(compact, log_handle)
+                        _emit(compact)
                 else:
                     _emit(
                         "[yellow]No matching group found on the opposite tracker.[/yellow]",
-                        log_handle,
                         indent=3,
                     )
                     if source_gid is not None:
                         suggestion = _cross_upload_url(source_tracker, source_gid)
-                        cross_upload_candidates.append(suggestion)
-                        _emit("Suggestion:", log_handle, indent=3)
+                        cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
+                        _emit("Suggestion:", indent=3)
                         _emit(
                             f"  Explore {suggestion} for possible cross-upload to {opposite_tracker.name.upper()}",
-                            log_handle,
                             indent=3,
                         )
             else:
-                hit = hits[0]
+                hit = results_list[0]
                 search_max = _extract_search_max(hit)
                 
                 if abbrev:
@@ -560,32 +614,29 @@ async def run_search_mode(
                         idx, total, source_tracker, source_gid or 0,
                         opposite_tracker, hit.group_id, collage_max, search_max, used_tier
                     )
-                    _emit(compact, log_handle)
+                    _emit(compact)
                 else:
                     _emit(
                         f"[Target, {opposite_tracker.name.upper()}] Found group: {hit.title} (ID {hit.group_id})",
-                        log_handle,
                         indent=3,
                     )
                     source_label = f"[Source, {source_tracker.name.upper()}] Collage max torrent size:"
                     source_size = _format_size(collage_max)
-                    _emit(_display_value(source_label, source_size), log_handle, indent=3)
+                    _emit(_display_value(source_label, source_size), indent=3)
                     target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
                     target_size = _format_size(search_max)
-                    _emit(_display_value(target_label, target_size), log_handle, indent=3)
+                    _emit(_display_value(target_label, target_size), indent=3)
 
                     if collage_max is None or search_max is None:
-                        _emit("[yellow]Cannot determine max-size match (missing data).[/yellow]", log_handle, indent=3)
+                        _emit("[yellow]Cannot determine max-size match (missing data).[/yellow]", indent=3)
                     elif collage_max == search_max:
                         _emit(
                             f"[Target, {opposite_tracker.name.upper()}] [green]Max size matches.[/green]",
-                            log_handle,
                             indent=3,
                         )
                     else:
                         _emit(
                             f"[Target, {opposite_tracker.name.upper()}] [magenta]Max size mismatch.[/magenta]",
-                            log_handle,
                             indent=3,
                         )
 
@@ -593,14 +644,31 @@ async def run_search_mode(
                 await asyncio.sleep(0.005)
 
         if cross_upload_candidates:
-            _emit("\n[End of Run]", log_handle)
-            _emit("  Explore the following for possible upload:", log_handle)
-            for url in cross_upload_candidates:
-                _emit(f"  {url}", log_handle)
+            _emit("\n[End of Run]")
+            _emit("  Explore the following for possible upload:")
+            
+            # Group by priority
+            by_priority = {}
+            for url, priority in cross_upload_candidates:
+                by_priority.setdefault(priority, []).append(url)
+            
+            # Display in priority order (highest first)
+            for priority in sorted(by_priority.keys(), reverse=True):
+                urls = by_priority[priority]
+                priority_label = {
+                    100: "Priority 100 (missing group)",
+                    50: "Priority 50 (new edition)",
+                    20: "Priority 20 (new media)",
+                    10: "Priority 10 (new encoding)"
+                }.get(priority, f"Priority {priority}")
+                
+                _emit(f"  {priority_label}:")
+                for url in urls:
+                    _emit(f"    {url}")
         elif entries:
-            _emit("\n[End of Run]", log_handle)
-            _emit("  No cross-upload candidates found.", log_handle)
+            _emit("\n[End of Run]")
+            _emit("  No cross-upload candidates found.")
     finally:
-        if log_handle:
-            _emit(f"[cyan][INFO][/cyan] Output mirrored to {log_path}", log_handle)
-            log_handle.close()
+        if log_path:
+            logger.info(f"Output mirrored to {log_path}")
+        logger.get_logger().close()
