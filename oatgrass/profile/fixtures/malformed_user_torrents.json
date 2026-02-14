@@ -1,0 +1,18 @@
+{
+  "response": {
+    "snatched": [
+      {
+        "groupId": "abc",
+        "torrentId": "100",
+        "name": "Bad Numeric A"
+      },
+      {
+        "groupId": "200",
+        "torrentId": "xyz",
+        "name": "Bad Numeric B"
+      }
+    ],
+    "uploaded": [],
+    "downloaded": []
+  }
+}

@@ -9,6 +9,10 @@ from typing import Optional
 import aiohttp
 
 from oatgrass.__version__ import __version__
+from oatgrass.rate_limits import (
+    DISCOGS_MAX_CONCURRENT_REQUESTS,
+    DISCOGS_MIN_INTERVAL_SECONDS,
+)
 
 
 class DiscogsService:
@@ -18,7 +22,7 @@ class DiscogsService:
         self.token = token
         self.user_agent = user_agent
         self.base_url = "https://api.discogs.com"
-        self.rate_limit = asyncio.Semaphore(25)
+        self.rate_limit = asyncio.Semaphore(DISCOGS_MAX_CONCURRENT_REQUESTS)
         self.last_request = 0
         self.headers = {
             "Authorization": f"Discogs token={self.token}",
@@ -29,8 +33,8 @@ class DiscogsService:
         """Make rate-limited request to Discogs API."""
         async with self.rate_limit:
             now = time.time()
-            if now - self.last_request < 2.4:  # ~25 requests per minute
-                await asyncio.sleep(2.4 - (now - self.last_request))
+            if now - self.last_request < DISCOGS_MIN_INTERVAL_SECONDS:
+                await asyncio.sleep(DISCOGS_MIN_INTERVAL_SECONDS - (now - self.last_request))
             
             self.last_request = time.time()
             

@@ -8,7 +8,7 @@ from oatgrass.search.edition_parser import parse_group_from_browse, parse_group_
 from oatgrass.search.edition_matcher import match_editions
 from oatgrass.search.edition_comparison import compare_editions
 from oatgrass.search.upload_candidates import find_upload_candidates
-from oatgrass.search.search_coordinator import search_with_tiers
+from oatgrass.search.tier_search_service import search_with_tiers
 
 
 async def process_entry_edition_aware(

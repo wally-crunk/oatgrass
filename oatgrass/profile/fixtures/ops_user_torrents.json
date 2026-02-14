@@ -1,0 +1,47 @@
+{
+  "response": {
+    "snatched": [
+      {
+        "groupId": "101",
+        "torrentId": "201",
+        "name": "Anonymized Album A",
+        "artistName": "John Doe",
+        "artistId": "1",
+        "media": "WEB",
+        "format": "FLAC",
+        "encoding": "24bit Lossless",
+        "size": 123456789
+      },
+      {
+        "name": "Utility Bundle",
+        "categoryName": "Applications"
+      }
+    ],
+    "uploaded": [
+      {
+        "groupId": "102",
+        "torrentId": "202",
+        "name": "Anonymized Album B",
+        "artistName": "Joe Bloggs",
+        "artistId": "2",
+        "media": "CD",
+        "format": "FLAC",
+        "encoding": "Lossless",
+        "size": 223456789
+      }
+    ],
+    "downloaded": [
+      {
+        "groupId": "103",
+        "torrentId": "203",
+        "name": "Anonymized Album C",
+        "artistName": "Zhang San",
+        "artistId": "3",
+        "media": "Vinyl",
+        "format": "FLAC",
+        "encoding": "Lossless",
+        "size": 323456789
+      }
+    ]
+  }
+}

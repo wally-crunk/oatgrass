@@ -60,6 +60,10 @@ desktop.ini
 .local/
 config.toml
 
+# Documentation (transmitted out of band)
+README.md
+CHANGELOG.md
+
 # Personal environments and ephemera
 .venv*/
 **/local/

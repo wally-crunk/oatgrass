@@ -7,6 +7,8 @@ import asyncio
 from rich.table import Table
 from rich.markup import escape
 from .config import OatgrassConfig
+from .rate_limits import enforce_gazelle_min_interval
+from .tracker_auth import build_tracker_auth_header
 from rich.console import Console
 from . import __version__
 
@@ -45,10 +47,11 @@ async def verify_discogs(session, api_key: str, timeout=10):
 async def verify_gazelle_tracker(session, api_key: str, url: str, name: str, timeout=10):
     """Verify Gazelle tracker (RED/OPS) API key and get username"""
     headers = {
-        'Authorization': api_key,
+        'Authorization': build_tracker_auth_header(name, api_key),
         'User-Agent': UA,
     }
     api_url = f"{url}/ajax.php?action=index"
+    await enforce_gazelle_min_interval(url, tracker_name=name, auth_mode="api_key")
     
     async with session.get(
         api_url,

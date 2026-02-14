@@ -15,6 +15,7 @@ class OatgrassLogger:
         self._file_handle = None
         self._start_time = datetime.now()
         self.debug_mode = debug
+        self._rate_limit_note_trackers: set[str] = set()
         
         if log_file:
             log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +60,19 @@ class OatgrassLogger:
     
     def api_wait(self, tracker: str, seconds: float):
         """Log API rate limiting wait"""
-        self.log(f"Rate limiting: waiting {seconds:.1f}s before next {tracker} API call", "[INFO] ")
+        _ = seconds
+        tracker_key = tracker.upper()
+        if tracker_key in self._rate_limit_note_trackers:
+            return
+        self._rate_limit_note_trackers.add(tracker_key)
+        self.log(
+            f"API rate limiting active for {tracker_key}; request pacing is enabled.",
+            "[INFO] ",
+        )
+
+    def api_wait_debug(self, tracker: str, seconds: float):
+        """Log API wait details (debug mode only)."""
+        self.debug(f"Rate limiting detail: waiting {seconds:.3f}s before next {tracker} API call")
     
     def api_retry(self, tracker: str, attempt: int, max_attempts: int, delay: int):
         """Log API retry"""

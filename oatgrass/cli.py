@@ -8,30 +8,156 @@ try:
     import asyncio
     import sys
     import argparse
+    import json
+    import time
+    from dataclasses import asdict
     from pathlib import Path
     from rich.console import Console
     from rich.prompt import Prompt
     from rich.table import Table
     from typing import Optional
     import oatgrass as pkg
-    from .config import OatgrassConfig, load_config
+    from .config import OatgrassConfig, TrackerConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
-    from .search.search_mode import run_search_mode
-    
-    # Check for scipy (required for Hungarian algorithm in edition matching)
-    try:
-        import scipy
-    except ImportError:
-        print("Error: scipy is required for edition matching (Hungarian algorithm)")
-        print("Please install: pip install scipy")
-        print("Or activate venv: source venv/bin/activate")
-        sys.exit(1)
+    from .rate_limits import GAZELLE_MIN_INTERVAL_SECONDS
+    from .profile.menu_service import ProfileMenuService, build_profile_summary, render_profile_summaries
+    from .profile.retriever import (
+        ListType,
+        ProfileTorrent,
+        format_list_label,
+        get_tracker_list_types,
+    )
+    from .profile.search_service import run_profile_list_search
+    from .profile.session_state import ProfileSessionState
+    from .profile.tracker_selection import configured_profile_trackers, resolve_profile_tracker
+    from .search.search_mode import run_search_mode, _next_run_path
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install required dependencies: pip install -r requirements.txt")
     sys.exit(1)
 
 console = Console()
+PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW = 3
+PROFILE_SEARCH_BEST_CASE_API_DELAY_SECONDS = GAZELLE_MIN_INTERVAL_SECONDS
+_CLI_SESSION_START_MONOTONIC = time.monotonic()
+_SCIPY_AVAILABLE: bool | None = None
+_SCIPY_HINT_EMITTED = False
+MAIN_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "Search for Cross-Upload Candidates",
+        (
+            ("S", "Search a collage or album"),
+        ),
+    ),
+    (
+        "Search using Profile",
+        (
+            ("1", "Get my profile list of previous torrents"),
+            ("2", "Search using a cached profile list"),
+        ),
+    ),
+    (
+        "Tools",
+        (
+            ("V", "Verify API Keys"),
+        ),
+    ),
+    (
+        "Oatgrass",
+        (
+            ("Q", "Quit"),
+        ),
+    ),
+)
+
+def _ui_info(message: str) -> None:
+    console.print(f"[cyan][INFO][/cyan] {message}")
+
+
+def _ui_warn(message: str) -> None:
+    console.print(f"[yellow][WARNING][/yellow] {message}")
+
+
+def _ui_error(message: str) -> None:
+    console.print(f"[red][ERROR][/red] {message}")
+
+
+def _ui_prompt(label: str, default: str | None = None) -> str:
+    if default is None:
+        return Prompt.ask(label)
+    return Prompt.ask(label, default=default)
+
+
+def _ui_prompt_yesno(
+    label: str,
+    *,
+    default_yes: bool,
+    allow_cancel: bool = False,
+) -> bool:
+    suffix = ("[Y/n" if default_yes else "[y/N") + (", c=cancel]" if allow_cancel else "]")
+
+    choice = _ui_prompt(f"{label} {suffix}", default="Y" if default_yes else "N").strip().lower()
+    if not choice:
+        return default_yes
+    first = choice[0]
+    if first == "y":
+        return True
+    if first == "n":
+        return False
+    if allow_cancel and first in {"c", "x"}:
+        return False
+    return default_yes
+
+
+def _reset_cli_session_timer() -> None:
+    global _CLI_SESSION_START_MONOTONIC
+    _CLI_SESSION_START_MONOTONIC = time.monotonic()
+
+
+def _format_elapsed_runtime(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3_600:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 86_400:
+        return f"{seconds / 3_600:.1f}h"
+    return f"{seconds / 86_400:.1f}d"
+
+
+def _ui_goodbye_with_elapsed() -> None:
+    elapsed = max(0.0, time.monotonic() - _CLI_SESSION_START_MONOTONIC)
+    _ui_info(f"Goodbye! Elapsed {_format_elapsed_runtime(elapsed)}")
+
+
+def _has_scipy() -> bool:
+    global _SCIPY_AVAILABLE
+    if _SCIPY_AVAILABLE is not None:
+        return _SCIPY_AVAILABLE
+    try:
+        import scipy  # noqa: F401
+    except Exception:
+        _SCIPY_AVAILABLE = False
+    else:
+        _SCIPY_AVAILABLE = True
+    return _SCIPY_AVAILABLE
+
+
+def _warn_missing_scipy_startup() -> None:
+    if _has_scipy():
+        return
+    _ui_warn(
+        "scipy not found: edition-aware matching is unavailable. "
+        "Group-only mode remains available."
+    )
+    _warn_missing_scipy_hint()
+
+
+def _warn_missing_scipy_hint() -> None:
+    global _SCIPY_HINT_EMITTED
+    if _SCIPY_HINT_EMITTED:
+        return
+    _ui_warn("Suggestion: Set up a venv, then run `source venv/bin/activate`.")
+    _SCIPY_HINT_EMITTED = True
 
 
 def redact_api_key(key: str) -> str:
@@ -45,11 +171,10 @@ def redact_api_key(key: str) -> str:
 
 def display_config_table(config: OatgrassConfig):
     """Display current API key configuration status"""
-    console.print(f"[cyan][INFO][/cyan] ✓ Read configuration file \"{config.config_path}\"... ok!")
-    console.print(f"[cyan][INFO][/cyan] To edit configuration, modify config.toml directly.\n")
-    console.print()
+    _ui_info(f"✓ Read configuration file \"{config.config_path}\"... ok!")
+    _ui_info("To edit configuration, modify config.toml directly.")
 
-    table = Table(title="Current API Key Configuration")
+    table = Table(title="API configuration")
     table.add_column("Service", style="cyan")
     table.add_column("Status", style="green")
     api_keys = config.api_keys.model_dump()
@@ -67,171 +192,406 @@ def display_config_table(config: OatgrassConfig):
             status = "✗ Not set"
         table.add_row(f"{tracker_name.upper()} Tracker", status)
     console.print(table)
+    console.print()
+    console.print()
 
 
 def main_menu(config: OatgrassConfig):
     """Main menu for Oatgrass API Key Verifier"""
+    cache = ProfileSessionState()
+
+    while True:
+        _render_main_menu(config)
+        choice = Prompt.ask("Choice", default="V").upper()
+        should_continue = _handle_main_menu_choice(config, cache, choice)
+        if not should_continue:
+            return
+
+
+def _render_main_menu(config: OatgrassConfig) -> None:
     console.clear()
     from rich.panel import Panel
+
     console.print(Panel("[bold blue]OATGRASS - Feed the gazelles[/bold blue]\nFind candidates for cross-uploading"))
     console.print()
     display_config_table(config)
-    console.print("[V] Verify API Keys")
-    console.print("[S] Search mode")
-    console.print("[Q] Quit")
+    for section_idx, (section_title, items) in enumerate(MAIN_MENU_SECTIONS):
+        console.print(section_title)
+        for key, label in items:
+            console.print(f"    [{key}] {label}")
+        if section_idx < len(MAIN_MENU_SECTIONS) - 1:
+            console.print()
     console.print()
 
-    choice = Prompt.ask("Choice", default="V").upper()
+
+def _handle_main_menu_choice(config: OatgrassConfig, cache: ProfileSessionState, choice: str) -> bool:
+    choice = {"G": "1", "M": "2"}.get(choice, choice)
+    if choice == "Q":
+        _ui_goodbye_with_elapsed()
+        return False
+
+    handlers = {
+        "1": lambda: _handle_profile_summary_action(config, cache),
+        "2": lambda: _handle_profile_search_action(config, cache),
+        "V": lambda: asyncio.run(verify_api_keys(config)),
+        "S": lambda: _run_search_mode_prompt(config),
+    }
+    handler = handlers.get(choice)
+    if handler is None:
+        _ui_warn("Unknown choice. Please select a listed option.")
+        _ui_prompt("Press Enter to continue", default="")
+        return True
+    handler()
     if choice == "V":
-        asyncio.run(verify_api_keys(config))
-        console.print("[cyan][INFO][/cyan] Verification complete. Goodbye!")
+        _ui_info("Verification complete.")
+        _ui_prompt("Press Enter to continue", default="")
     elif choice == "S":
-        # Prompt for URL/ID
-        search_mode_target = Prompt.ask("Collage or group URL/ID").strip()
-        
-        # If bare ID, prompt for source tracker
-        tracker_key = None
-        if not (search_mode_target.startswith("http://") or search_mode_target.startswith("https://")):
-            console.print("\nSource tracker (for bare ID):")
-            console.print("  [R] RED (default)")
-            console.print("  [O] OPS")
-            tracker_choice = Prompt.ask("Source tracker", default="R").strip().upper()
-            tracker_key = "ops" if tracker_choice == "O" else "red"
-        
-        # Prompt for output mode
-        console.print("\nOutput mode:")
-        console.print("  [A] Abbreviated - One line per group")
-        console.print("  [N] Normal (default) - Album matching + brief candidate summary")
-        console.print("  [V] Verbose - Full edition details, confidence scores")
-        console.print("  [D] Debug - API calls, JSON responses, timestamps")
-        output_choice = Prompt.ask("Output mode", default="N").strip().upper()
-        abbrev = output_choice == "A"
-        verbose = output_choice == "V"
-        debug = output_choice == "D"
-        
-        # Prompt for matching mode
-        console.print("\nMatching mode:")
-        console.print("  [E] Edition-aware (default) - Match at edition/media/encoding level")
-        console.print("  [G] Group-only - Stop when group is found")
-        matching_choice = Prompt.ask("Matching mode", default="E").strip().upper()
-        basic = matching_choice == "G"
-        
-        # Prompt for fallback mode
-        console.print("\nFallback mode:")
-        console.print("  [F] Full 5-tier search (default) - Exact + normalization + Discogs")
-        console.print("  [D] Disable Discogs (4-tier) - Skip artist name variations")
-        console.print("  [X] Exact match only (1-tier) - Fastest, may miss matches")
-        fallback_choice = Prompt.ask("Fallback mode", default="F").strip().upper()
-        no_fallback = fallback_choice == "X"
-        no_discogs = fallback_choice == "D" or (fallback_choice == "F" and not config.api_keys.discogs_key)
-        
-        asyncio.run(run_search_mode(
-            config, 
-            search_mode_target,
-            tracker_key=tracker_key,
-            strict=no_fallback,
-            abbrev=abbrev,
-            verbose=verbose,
-            debug=debug,
-            basic=basic,
-            no_discogs=no_discogs,
-        ))
-        console.print("[cyan][INFO][/cyan] Search mode run complete. Goodbye!")
+        _ui_info("Search mode run complete.")
+        _ui_prompt("Press Enter to continue", default="")
+    return True
+
+
+def _select_profile_list_action(
+    config: OatgrassConfig,
+    cache: ProfileSessionState,
+    option_choice: str,
+) -> tuple[str, TrackerConfig, ListType] | None:
+    tracker_key = _prompt_source_tracker_choice(config, cache.tracker_key)
+    tracker_key, tracker = resolve_profile_tracker(config, tracker_key)
+    available_list_types = list(get_tracker_list_types(tracker.name))
+    list_type = _prompt_profile_list_choice(available_list_types)
+    if not _ensure_cache_for_followup_action(config, cache, list_type, option_choice, tracker_key):
+        _ui_prompt("Press Enter to continue", default="")
+        return None
+    return tracker_key, tracker, list_type
+
+
+def _handle_profile_summary_action(config: OatgrassConfig, cache: ProfileSessionState) -> None:
+    try:
+        tracker_key = _prompt_source_tracker_choice(config, cache.tracker_key)
+        tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
+        cache.set_snapshot(tracker_key, lists)
+    except Exception as exc:
+        _ui_error(f"Profile summary failed: {exc}")
     else:
-        console.print("[cyan][INFO][/cyan] Goodbye!")
+        _ui_info("Profile summary complete.")
+    _ui_prompt("Press Enter to continue", default="")
 
 
-def show_help():
-    """Display help information"""
-    help_text = f"""
-    OATGRASS - Feed the gazelles v{getattr(pkg, '__version__', '0.0.0')}
-    \"Find candidates for cross-uploading\"
+def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionState) -> None:
+    selected = _select_profile_list_action(config, cache, "2")
+    if selected is None:
+        return
 
-USAGE:
-    oatgrass [OPTIONS] [URL_OR_ID]
-    python -m oatgrass [OPTIONS] [URL_OR_ID]
+    tracker_key, _tracker, list_type = selected
+    if not _has_scipy():
+        _ui_warn(
+            "scipy not found: option 2/M requires edition-aware matching. "
+            "Use option S in Group-only mode or install scipy."
+        )
+        _warn_missing_scipy_hint()
+        _ui_prompt("Press Enter to continue", default="")
+        return
 
-ARGUMENTS:
-    URL_OR_ID         Collage URL or group URL to process
+    entries = cache.lists.get(list_type, [])
+    _show_profile_search_estimate(config, tracker_key, list_type, len(entries))
+    if not _ui_prompt_yesno("Continue profile search?", default_yes=True, allow_cancel=True):
+        _ui_prompt("Press Enter to continue", default="")
+        return
 
-OPTIONS:
-    -h, --help        Show this help message and exit
-    --verify          Verify keys and exit (non-interactive)
-    -c, --config PATH Path to config.toml (file or directory)
-    -o, --output DIR  Output directory for run logs (default: ./output)
+    result = asyncio.run(
+        run_profile_list_search(
+            config=config,
+            source_tracker_key=tracker_key,
+            list_type=list_type,
+            entries=entries,
+        )
+    )
+    _display_profile_search_result(result.candidate_urls, result.processed, result.skipped)
+    _ui_prompt("Press Enter to continue", default="")
 
-Output modes:
-    -a, --abbrev      Abbreviated output (one line per group)
-    -n, --normal      Normal output mode (default)
-    -v, --verbose     Verbose output with full edition details
-    -d, --debug       Debug mode with API calls, JSON responses, timestamps
 
-Matching modes:
-  --search-editions   Search at edition level (default)
-        · Matches editions by year, title, label, catalog (fuzzy matching)
-        · Compares individual torrents within matched editions
-        · Finds missing encodings (e.g., WEB 24bit FLAC on source but not target)
-        · Ignores lossy formats when lossless exists
-        → Fewer false positives, requires some review
+async def _run_profile_summary_menu(config: OatgrassConfig, tracker_key: str | None = None):
+    tracker_key, tracker = resolve_profile_tracker(config, tracker_key)
+    service = ProfileMenuService(tracker)
+    try:
+        lists = await service.fetch_all_lists()
+        summaries = [build_profile_summary(list_type, entries) for list_type, entries in lists.items()]
+        render_profile_summaries(console, tracker.name.upper(), summaries)
+        saved_path = _persist_profile_lists(lists, tracker.name.upper())
+        _ui_info(f"Profile lists persisted to {saved_path}")
+        return tracker_key, lists
+    finally:
+        await service.close()
 
-  --search-groups     Search at group level (ignore editions)
-        · No edition or encoding analysis
-        → More false positives, requires more review
 
-Fallback modes:
-  --no-discogs        Disable Discogs artist name variation (disable tier 5)
-        · Faster results
-        · Automatically chosen if no Discogs key is available
+def _serialize_profile_entries(entries: list[ProfileTorrent]) -> list[dict]:
+    serialized: list[dict] = []
+    for entry in entries:
+        data = asdict(entry)
+        metadata = data.get("metadata")
+        data["metadata"] = dict(metadata or {})
+        serialized.append(data)
+    return serialized
 
-  --no-fallback       No fallback tiers, exact match only (disable tiers 2-5)
-        · Fastest results
-        · Will miss groups that are slightly spelled differently between trackers
 
-SEARCH STRATEGY (5-tier default):
-    Tier 1: Exact match
-    Tier 2: Light normalization (lowercase, HTML unescape)
-    Tier 3: Aggressive normalization (strip punctuation, remove stopwords)
-    Tier 4: Colon cutoff (truncate at first colon)
-    Tier 5: Discogs ANV fallback (artist name variations, requires API key)
+def _persist_profile_lists(
+    lists: dict[ListType, list[ProfileTorrent]],
+    tracker_name: str,
+    output_dir: Path | None = None,
+) -> Path:
+    run_path = _next_run_path(output_dir or Path("output"))
+    json_path = run_path.with_suffix(".profile-lists.json")
+    payload = {
+        "tracker": tracker_name,
+        "lists": {
+            list_type: _serialize_profile_entries(entries)
+            for list_type, entries in lists.items()
+        },
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2))
+    return json_path
 
-EXAMPLES:
-    oatgrass https://red.foo/collages.php?id=12345
-    oatgrass -v https://red.foo/torrents.php?id=67890
-    oatgrass -a https://ops.bar/collages.php?id=999
-    oatgrass --verify
 
-CONFIGURATION:
-    Requires config.toml with API keys for RED, OPS, and optionally Discogs.
-    Searched in: --config PATH, ./config.toml, or repo root.
+def _prompt_profile_list_choice(available_lists: list[ListType]) -> ListType:
+    if not available_lists:
+        raise ValueError("No available profile lists to choose from.")
 
-EXIT CODES:
-    0    Success
-    1    Failure (missing config, invalid keys, or error)
-"""
-    print(help_text)
+    console.print("\nAvailable profile lists:")
+    for idx, list_type in enumerate(available_lists, start=1):
+        label = format_list_label(list_type)
+        console.print(f"  [{idx}] {label} ({list_type})")
+
+    choice = _ui_prompt("List", default="1").strip().lower()
+    if choice.isdigit() and 1 <= int(choice) <= len(available_lists):
+        return available_lists[int(choice) - 1]
+
+    aliases: dict[str, ListType] = {}
+    for list_type in available_lists:
+        label = format_list_label(list_type).lower()
+        aliases[list_type.lower()] = list_type
+        aliases[label] = list_type
+        aliases.setdefault(list_type[0].lower(), list_type)
+        aliases.setdefault(label[0], list_type)
+    if choice in aliases:
+        return aliases[choice]
+    return available_lists[0]
+
+
+def _ensure_cache_for_followup_action(
+    config: OatgrassConfig,
+    cache: ProfileSessionState,
+    list_type: ListType,
+    option_choice: str,
+    tracker_key: str,
+) -> bool:
+    _, tracker = resolve_profile_tracker(config, tracker_key)
+    if cache.has_list(tracker_key, list_type):
+        return True
+    _ui_warn(f"No cached '{list_type}' data found for {tracker.name.upper()} for option {option_choice}.")
+    if not _ui_prompt_yesno("Fetch profile lists now?", default_yes=True):
+        return False
+    tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
+    cache.set_snapshot(tracker_key, lists)
+    if not cache.has_list(tracker_key, list_type):
+        _ui_warn(f"Requested list '{list_type}' is empty after fetch.")
+        return False
+    return True
+
+
+def _prompt_source_tracker_choice(config: OatgrassConfig, cached_tracker: str | None) -> str:
+    trackers = configured_profile_trackers(config)
+    if not trackers:
+        raise ValueError("No configured tracker with API key found.")
+    default_choice = trackers[0][0].upper()
+    if cached_tracker:
+        for key, _tracker in trackers:
+            if key.lower() == cached_tracker.lower():
+                default_choice = key.upper()
+                break
+
+    console.print("\nSource tracker:")
+    for key, tracker in trackers:
+        console.print(f"  [{key.upper()}] {tracker.name.upper()} ({tracker.url})")
+    selected = _ui_prompt("Source tracker", default=default_choice).strip()
+    selected_key, _ = resolve_profile_tracker(config, selected)
+    return selected_key
+
+
+def _run_search_mode_prompt(config: OatgrassConfig) -> None:
+    def _prompt_menu_choice(
+        title: str,
+        prompt_label: str,
+        options: list[tuple[str, str]],
+        *,
+        default: str,
+    ) -> str:
+        console.print(f"\n{title}:")
+        for key, label in options:
+            console.print(f"  [{key}] {label}")
+        return _ui_prompt(prompt_label, default=default).strip().upper()
+
+    search_mode_target = _ui_prompt("Collage or group URL/ID").strip()
+
+    tracker_key = None
+    if not (search_mode_target.startswith("http://") or search_mode_target.startswith("https://")):
+        tracker_choice = _prompt_menu_choice(
+            "Source tracker (for bare ID)",
+            "Source tracker",
+            [("R", "RED (default)"), ("O", "OPS")],
+            default="R",
+        )
+        tracker_key = "ops" if tracker_choice == "O" else "red"
+
+    output_choice = _prompt_menu_choice(
+        "Output mode",
+        "Output mode",
+        [
+            ("A", "Abbreviated - One line per group"),
+            ("N", "Normal (default) - Album matching + brief candidate summary"),
+            ("V", "Verbose - Full edition details, confidence scores"),
+            ("D", "Debug - API calls, JSON responses, timestamps"),
+        ],
+        default="N",
+    )
+    abbrev = output_choice == "A"
+    verbose = output_choice == "V"
+    debug = output_choice == "D"
+
+    if _has_scipy():
+        matching_choice = _prompt_menu_choice(
+            "Matching mode",
+            "Matching mode",
+            [
+                ("E", "Edition-aware (default) - Match at edition/media/encoding level"),
+                ("G", "Group-only - Stop when group is found"),
+            ],
+            default="E",
+        )
+        basic = matching_choice == "G"
+    else:
+        _ui_warn("scipy not found: matching mode is fixed to Group-only for this run.")
+        _warn_missing_scipy_hint()
+        basic = True
+
+    fallback_choice = _prompt_menu_choice(
+        "Fallback mode",
+        "Fallback mode",
+        [
+            ("F", "Full 5-tier search (default) - Exact + normalization + Discogs"),
+            ("D", "Disable Discogs (4-tier) - Skip artist name variations"),
+            ("X", "Exact match only (1-tier) - Fastest, may miss matches"),
+        ],
+        default="F",
+    )
+    no_fallback = fallback_choice == "X"
+    no_discogs = fallback_choice == "D" or (fallback_choice == "F" and not config.api_keys.discogs_key)
+
+    asyncio.run(run_search_mode(
+        config,
+        search_mode_target,
+        tracker_key=tracker_key,
+        strict=no_fallback,
+        abbrev=abbrev,
+        verbose=verbose,
+        debug=debug,
+        basic=basic,
+        no_discogs=no_discogs,
+    ))
+
+
+def _display_profile_search_result(candidate_urls: list[tuple[str, int]], processed: int, skipped: int) -> None:
+    _ui_info(f"Profile search processed={processed}, skipped={skipped}")
+    if not candidate_urls:
+        _ui_info("No cross-upload candidates found for cached rows.")
+        return
+    _ui_info("Candidate source torrents to review:")
+    for url, priority in sorted(candidate_urls, key=lambda item: item[1], reverse=True):
+        console.print(f"  Priority {priority}: {url}")
+
+
+def _show_profile_search_estimate(
+    config: OatgrassConfig,
+    source_tracker_key: str,
+    list_type: ListType,
+    entry_count: int,
+) -> None:
+    per_row_calls = PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW
+    try:
+        from .profile.search_service import _pick_opposite_tracker
+
+        source_key, _ = resolve_profile_tracker(config, source_tracker_key)
+        _, target_tracker = _pick_opposite_tracker(config.trackers, source_key)
+        # RED target requires one additional group-detail call in the current flow.
+        if target_tracker.name.lower() == "red":
+            per_row_calls += 1
+    except Exception:
+        pass
+
+    _show_duration_estimate(
+        entry_count=entry_count,
+        per_row_calls=per_row_calls,
+        per_call_seconds=PROFILE_SEARCH_BEST_CASE_API_DELAY_SECONDS,
+    )
+
+
+def _show_duration_estimate(*, entry_count: int, per_row_calls: int, per_call_seconds: float) -> None:
+    best_case_seconds = entry_count * per_row_calls * per_call_seconds
+    if best_case_seconds < 60:
+        return
+    per_row_seconds = per_row_calls * per_call_seconds
+    duration_value, duration_unit = _largest_duration_unit(best_case_seconds)
+    _ui_info("Estimated time required:")
+    _ui_info(f"     {entry_count:,} rows,  about {_format_seconds_value(per_row_seconds)} seconds each")
+    _ui_info(f"     = {duration_value:.1f} {duration_unit}")
+
+
+def _largest_duration_unit(total_seconds: float) -> tuple[float, str]:
+    if total_seconds >= 86_400:
+        return total_seconds / 86_400, "days"
+    if total_seconds >= 3_600:
+        return total_seconds / 3_600, "hours"
+    return total_seconds / 60, "minutes"
+
+
+def _format_seconds_value(seconds: float) -> str:
+    if float(seconds).is_integer():
+        return f"{seconds:.0f}"
+    return f"{seconds:.1f}"
+
+
+def show_help(parser: argparse.ArgumentParser) -> None:
+    print(f"OATGRASS v{getattr(pkg, '__version__', '0.0.0')} - Find candidates for cross-uploading")
+    print()
+    parser.print_help()
 
 
 def main():
     """Entry point"""
+    _reset_cli_session_timer()
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-h', '--help', action='store_true', help='Show help')
-    parser.add_argument('--verify', action='store_true', help='Verify keys and exit')
-    parser.add_argument('-c', '--config', metavar='PATH', help='Path to config.toml (file or directory)')
-    parser.add_argument('-o', '--output', metavar='DIR', help='Output directory for run logs (default: ./output)')
-    parser.add_argument('-a', '--abbrev', action='store_true', help='Abbreviated output for search mode')
-    parser.add_argument('-n', '--normal', action='store_true', help='Normal output mode (default)')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output with full edition details')
-    parser.add_argument('-d', '--debug', action='store_true', help='Debug mode with API calls, JSON responses, timestamps')
-    parser.add_argument('--search-editions', action='store_true', help='Search at edition level (default)')
-    parser.add_argument('--search-groups', action='store_true', help='Search at group level (ignore editions)')
-    parser.add_argument('--no-discogs', action='store_true', help='Disable Discogs artist name variation (disable tier 5)')
-    parser.add_argument('--no-fallback', action='store_true', help='No fallback tiers, exact match only (disable tiers 2-5)')
+    for args, kwargs in (
+        (("-h", "--help"), {"action": "store_true", "help": "Show help"}),
+        (("--verify",), {"action": "store_true", "help": "Verify keys and exit"}),
+        (("-c", "--config"), {"metavar": "PATH", "help": "Path to config.toml (file or directory)"}),
+        (("-o", "--output"), {"metavar": "DIR", "help": "Output directory for run logs (default: ./output)"}),
+        (("-a", "--abbrev"), {"action": "store_true", "help": "Abbreviated output for search mode"}),
+        (("-n", "--normal"), {"action": "store_true", "help": "Normal output mode (default)"}),
+        (("-v", "--verbose"), {"action": "store_true", "help": "Verbose output with full edition details"}),
+        (("-d", "--debug"), {"action": "store_true", "help": "Debug mode with API calls, JSON responses, timestamps"}),
+        (("--search-editions",), {"action": "store_true", "help": "Search at edition level (default)"}),
+        (("--search-groups",), {"action": "store_true", "help": "Search at group level (ignore editions)"}),
+        (("--no-discogs",), {"action": "store_true", "help": "Disable Discogs artist name variation (disable tier 5)"}),
+        (("--no-fallback",), {"action": "store_true", "help": "No fallback tiers, exact match only (disable tiers 2-5)"}),
+    ):
+        parser.add_argument(*args, **kwargs)
     parser.add_argument('url_or_id', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
         args = parser.parse_args()
         if args.help:
-            show_help()
+            show_help(parser)
             sys.exit(0)
 
         def resolve_config_path(args_config: Optional[str]) -> Path:
@@ -245,31 +605,33 @@ def main():
             if cwd_candidate.exists():
                 return cwd_candidate
 
-            try:
-                pkg_dir = Path(__file__).resolve().parent
-                repo_root = pkg_dir.parent
-                root_candidate = repo_root / "config.toml"
-                if root_candidate.exists() and (
-                    (repo_root / ".git").exists() or (repo_root / "pyproject.toml").exists()
-                ):
-                    return root_candidate
-            except Exception:
-                pass
+            repo_root = Path(__file__).resolve().parent.parent
+            root_candidate = repo_root / "config.toml"
+            if root_candidate.exists() and (
+                (repo_root / ".git").exists() or (repo_root / "pyproject.toml").exists()
+            ):
+                return root_candidate
             return cwd_candidate
 
         config_path = resolve_config_path(args.config)
         config = load_config(config_path)
+        _warn_missing_scipy_startup()
         
         if args.url_or_id:
             # Check for conflicting flags
             if sum([args.abbrev, args.verbose, args.debug]) > 1:
-                console.print("[red][ERROR][/red] Cannot use multiple output modes (--abbrev, --verbose, --debug)")
+                _ui_error("Cannot use multiple output modes (--abbrev, --verbose, --debug)")
                 sys.exit(1)
             if args.search_editions and args.search_groups:
-                console.print("[red][ERROR][/red] Cannot use both --search-editions and --search-groups")
+                _ui_error("Cannot use both --search-editions and --search-groups")
                 sys.exit(1)
             
             output_dir = Path(args.output).expanduser() if args.output else Path("output")
+            basic_mode = args.search_groups
+            if not basic_mode and not _has_scipy():
+                _ui_warn("scipy not found: falling back to --search-groups for this run.")
+                _warn_missing_scipy_hint()
+                basic_mode = True
             
             asyncio.run(
                 run_search_mode(
@@ -279,7 +641,7 @@ def main():
                     abbrev=args.abbrev,
                     verbose=args.verbose,
                     debug=args.debug,
-                    basic=args.search_groups,
+                    basic=basic_mode,
                     no_discogs=args.no_discogs,
                     output_dir=output_dir,
                 )
@@ -287,17 +649,17 @@ def main():
             sys.exit(0)
 
         if args.verify:
-            console.print("[cyan][INFO][/cyan] Verifying API Keys...")
+            _ui_info("Verifying API Keys...")
             result = asyncio.run(verify_api_keys(config))
             sys.exit(0 if result else 1)
         else:
             main_menu(config)
             sys.exit(0)
     except KeyboardInterrupt:
-        console.print("[cyan][INFO][/cyan] \nGoodbye!")
+        _ui_goodbye_with_elapsed()
         sys.exit(0)
     except Exception as e:
-        console.print(f"[red][ERROR][/red] Fatal error: {e}")
+        _ui_error(f"Fatal error: {e}")
         sys.exit(1)
 
 

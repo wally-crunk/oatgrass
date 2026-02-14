@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar
 
 import aiohttp
 
 from oatgrass.config import TrackerConfig
+from oatgrass.rate_limits import (
+    GAZELLE_MIN_INTERVAL_SECONDS,
+    GAZELLE_WAIT_LOG_THRESHOLD_SECONDS,
+    enforce_gazelle_min_interval,
+)
 from oatgrass.search.protocols import GazelleClient
 from oatgrass.search.types import GazelleSearchResult
+from oatgrass.tracker_auth import build_tracker_auth_header
 from oatgrass import logger
 from oatgrass.__version__ import __version__
 
 DEFAULT_USER_AGENT = f"Oatgrass/{__version__}"
+_T = TypeVar("_T")
 
 
 class GazelleServiceAdapter(GazelleClient):
@@ -25,7 +32,7 @@ class GazelleServiceAdapter(GazelleClient):
         tracker: TrackerConfig,
         timeout: int = 10,
         max_concurrency: int = 3,
-        min_interval: float = 1.0,
+        min_interval_seconds: float = GAZELLE_MIN_INTERVAL_SECONDS,
     ):
         if not tracker.api_key:
             raise ValueError("Gazelle tracker API key is required for search adapter.")
@@ -34,8 +41,10 @@ class GazelleServiceAdapter(GazelleClient):
         self.timeout = timeout
         self.base_url = tracker.url.rstrip("/")
         self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._min_interval = min_interval
-        self._last_request = 0.0
+        self._min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self._auth_mode = "api_key"
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
 
     async def search(
         self,
@@ -71,62 +80,130 @@ class GazelleServiceAdapter(GazelleClient):
         params = {"action": "torrentgroup", "id": group_id}
         return await self._request(params)
 
+    async def get_collage(self, collage_id: int, page: int = 1) -> Dict[str, Any]:
+        """Get collage details using ajax.php?action=collage."""
+        params = {"action": "collage", "id": collage_id, "page": page}
+        return await self._request(params)
+
+    async def get_index(self) -> Dict[str, Any]:
+        """Get index payload for current authenticated user."""
+        return await self._request({"action": "index"})
+
+    async def get_user_torrents(
+        self,
+        *,
+        list_type: str,
+        user_id: int,
+        limit: int,
+        offset: int,
+    ) -> Dict[str, Any]:
+        """Get paginated user_torrents payload."""
+        params = {
+            "action": "user_torrents",
+            "type": list_type,
+            "id": user_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        return await self._request(params)
+
+    async def get_torrent(self, torrent_id: int) -> Dict[str, Any]:
+        """Get torrent details using ajax.php?action=torrent."""
+        params = {"action": "torrent", "id": torrent_id}
+        return await self._request(params)
+
     async def _request(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        status, data, elapsed_ms = await self._request_with_retries(
+            params,
+            lambda response: response.json(),
+        )
+        logger.get_logger().api_response(status, data, elapsed_ms)
+        return data
+
+    async def _request_with_retries(
+        self,
+        params: Dict[str, Any],
+        parser: Callable[[aiohttp.ClientResponse], Awaitable[_T]],
+    ) -> tuple[int, _T, float]:
         url = f"{self.base_url}/ajax.php"
-        headers = self._get_headers()
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        
-        # Debug logging: API request
         logger.get_logger().api_request("GET", url, params)
-        
         max_retries = 3
         request_start = time.time()
 
         async with self._semaphore:
             await self._enforce_interval()
-            
+            session = await self._ensure_session()
             for attempt in range(max_retries):
                 try:
-                    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                        async with session.get(url, params=params) as response:
-                            if response.status >= 400:
-                                text = await response.text()
-                                raise aiohttp.ClientResponseError(
-                                    request_info=response.request_info,
-                                    history=response.history,
-                                    status=response.status,
-                                    message=text,
-                                    headers=response.headers,
-                                )
-                            data = await response.json()
-                            elapsed_ms = (time.time() - request_start) * 1000
-                            
-                            # Debug logging: API response
-                            logger.get_logger().api_response(response.status, data, elapsed_ms)
-                            
-                            self._last_request = time.monotonic()
-                            return data
-                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    async with session.get(url, params=params) as response:
+                        if response.status >= 400:
+                            text = await response.text()
+                            exc = aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=response.status,
+                                message=text,
+                                headers=response.headers,
+                            )
+                            # Retry only transient server failures and explicit throttling.
+                            if attempt < max_retries - 1 and response.status in {429, 500, 502, 503, 504}:
+                                delay = self._retry_delay_seconds(attempt=attempt, retry_after=response.headers.get("Retry-After"))
+                                logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
+                                await asyncio.sleep(delay)
+                                continue
+                            raise exc
+                        data = await parser(response)
+                        elapsed_ms = (time.time() - request_start) * 1000
+                        return response.status, data, elapsed_ms
+                except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError):
                     if attempt < max_retries - 1:
-                        delay = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                        delay = 2 ** (attempt + 1)
                         logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
                         await asyncio.sleep(delay)
                     else:
                         logger.get_logger().api_failed(self.tracker.name.upper(), max_retries)
                         raise
 
+    @staticmethod
+    def _retry_delay_seconds(*, attempt: int, retry_after: str | None) -> int:
+        if retry_after:
+            try:
+                value = int(float(retry_after))
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 2 ** (attempt + 1)
+
     async def _enforce_interval(self) -> None:
-        now = time.monotonic()
-        wait = self._min_interval - (now - self._last_request)
-        if wait > 0:
-            if wait > 1.0:  # Only log if waiting more than 1 second
-                logger.get_logger().api_wait(self.tracker.name.upper(), wait)
-            await asyncio.sleep(wait)
+        wait = await enforce_gazelle_min_interval(
+            self.base_url,
+            min_interval_seconds=self._min_interval_seconds,
+            tracker_name=self.tracker.name,
+            auth_mode=self._auth_mode,
+        )
+        log = logger.get_logger()
+        log.api_wait_debug(self.tracker.name.upper(), wait)
+        if wait > GAZELLE_WAIT_LOG_THRESHOLD_SECONDS:
+            log.api_wait(self.tracker.name.upper(), wait)
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        session = self._session
+        if session is not None and not session.closed:
+            return session
+
+        async with self._session_lock:
+            session = self._session
+            if session is None or session.closed:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                self._session = aiohttp.ClientSession(
+                    headers=self._get_headers(),
+                    timeout=timeout,
+                )
+            return self._session
 
     def _get_headers(self) -> Dict[str, str]:
-        auth = self.tracker.api_key
-        if self.tracker.name.lower() != "red":
-            auth = f"token {self.tracker.api_key}"
+        auth = build_tracker_auth_header(self.tracker.name, self.tracker.api_key)
         return {"Authorization": auth, "User-Agent": DEFAULT_USER_AGENT}
 
     def _map_result(self, result: Dict[str, Any]) -> GazelleSearchResult:
@@ -153,4 +230,8 @@ class GazelleServiceAdapter(GazelleClient):
     
     async def close(self) -> None:
         """Close any open connections."""
-        pass  # No persistent connections to close
+        async with self._session_lock:
+            session = self._session
+            self._session = None
+        if session is not None and not session.closed:
+            await session.close()
