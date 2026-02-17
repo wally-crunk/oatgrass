@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, List, Literal, Mapping, Tuple
+from typing import Any, Callable, List, Literal, Mapping
 
 import aiohttp
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -33,36 +33,11 @@ LIST_TYPE_LABELS: dict[ListType, str] = {
     "snatched-unseeded": "Snatched (Unseeded)",
     "uploaded-unseeded": "Uploaded (Unseeded)",
 }
-TRACKER_LIST_TYPE_OPTIONS: dict[str, Tuple[ListType, ...]] = {
-    "ops": (
-        "snatched",
-        "downloaded",
-        "uploaded",
-        "leeching",
-        "seeding",
-        "snatched-unseeded",
-        "uploaded-unseeded",
-    ),
-    "red": (
-        "seeding",
-        "leeching",
-        "uploaded",
-        "snatched",
-    ),
-}
-DEFAULT_TRACKER_LIST_TYPES: Tuple[ListType, ...] = ("snatched", "uploaded", "downloaded")
-
-
-def get_tracker_list_types(tracker_name: str) -> Tuple[ListType, ...]:
-    return TRACKER_LIST_TYPE_OPTIONS.get(tracker_name.lower(), DEFAULT_TRACKER_LIST_TYPES)
-
-
 def format_list_label(list_type: ListType) -> str:
     return LIST_TYPE_LABELS.get(list_type, list_type.replace("-", " ").title())
 
 
 DEFAULT_PAGE_SIZE = 500
-MAX_ITEMS_PER_LIST = 10_000
 MAX_MALFORMED_NUMERIC = 2
 MAX_PAGE_RETRIES = 3
 
@@ -89,7 +64,7 @@ class ProfileTorrent:
 
 
 class ProfileRetriever:
-    """Fetches snatched/uploaded/downloaded entries for a tracker profile."""
+    """Fetches tracker-supported profile list entries using a generic row parser."""
 
     def __init__(
         self,
@@ -123,15 +98,17 @@ class ProfileRetriever:
         list_type: ListType,
         limit: int = DEFAULT_PAGE_SIZE,
         offset: int = 0,
-        max_items: int = MAX_ITEMS_PER_LIST,
+        max_items: int | None = None,
         task_index: int = 1,
         task_total: int = 1,
     ) -> List[ProfileTorrent]:
         """Return profile entries for the requested list type."""
         if list_type not in ALLOWED_LIST_TYPES:
             raise ValueError(f"Unsupported list type '{list_type}'")
-        if limit <= 0 or max_items <= 0:
-            raise ValueError("limit and max_items must be greater than 0")
+        if limit <= 0:
+            raise ValueError("limit must be greater than 0")
+        if max_items is not None and max_items <= 0:
+            raise ValueError("max_items must be greater than 0")
         if offset < 0:
             raise ValueError("offset must be >= 0")
 
@@ -145,9 +122,11 @@ class ProfileRetriever:
         known_total_pages: int | None = None
         known_total_items: int | None = None
 
-        while len(accepted_entries) < max_items:
+        while True:
+            if max_items is not None and len(accepted_entries) >= max_items:
+                break
             page += 1
-            page_limit = min(limit, max_items - len(accepted_entries))
+            page_limit = limit if max_items is None else min(limit, max_items - len(accepted_entries))
             page_progress = f"[Page {page}]" if known_total_pages is None else f"[Page {page} of {known_total_pages}]"
             logger.info(
                 f"[Task {task_index} of {task_total}] {page_progress} "
@@ -177,7 +156,7 @@ class ProfileRetriever:
                 except (TypeError, ValueError):
                     total_items = None
                 if total_items is not None and total_items >= 0:
-                    known_total_items = min(total_items, max_items)
+                    known_total_items = min(total_items, max_items) if max_items is not None else total_items
                     known_total_pages = max(1, (known_total_items + limit - 1) // limit)
 
             if not raw_entries:
@@ -204,14 +183,14 @@ class ProfileRetriever:
                     logger.warning("Skipping possible non-music profile row (missing IDs)")
                     continue
                 accepted_entries.append(mapped)
-                if len(accepted_entries) >= max_items:
+                if max_items is not None and len(accepted_entries) >= max_items:
                     break
 
             current_offset += len(raw_entries)
             if len(raw_entries) < page_limit:
                 break
 
-        if len(accepted_entries) >= max_items:
+        if max_items is not None and len(accepted_entries) >= max_items:
             logger.warning(
                 f"{list_type} cache capped at {max_items:,} items; "
                 "results may be partial for this list"

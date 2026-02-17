@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from datetime import datetime, timedelta
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +16,7 @@ from oatgrass.profile.tracker_selection import resolve_profile_tracker
 from oatgrass.search.gazelle_client import GazelleServiceAdapter
 from oatgrass.search.search_mode import _next_run_path, _pick_opposite_tracker
 
+PROFILE_SEARCH_PROGRESS_HEARTBEAT_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class ProfileSearchResult:
@@ -21,6 +24,74 @@ class ProfileSearchResult:
     processed: int
     skipped: int
     candidate_urls: list[tuple[str, int]]
+
+
+@dataclass
+class _ProgressState:
+    total: int
+    started_at: float
+    completed: int = 0
+    skipped: int = 0
+    candidates: int = 0
+    current_index: int = 0
+    done: bool = False
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _render_progress_line(state: _ProgressState) -> str:
+    return f"   Working: {_timing_phrase(state)}"
+
+
+def _progress_timing_text(state: _ProgressState) -> tuple[str, str | None, str | None]:
+    elapsed = time.monotonic() - state.started_at
+    rate = state.completed / elapsed if elapsed > 0 else 0.0
+    remaining = max(0, state.total - state.completed)
+    eta = remaining / rate if rate > 0 else None
+    elapsed_text = _format_duration(elapsed)
+    if eta is None:
+        return elapsed_text, None, None
+    eta_text = _format_duration(eta)
+    finish_text = (datetime.now().astimezone() + timedelta(seconds=eta)).strftime("%H:%M:%S")
+    return elapsed_text, eta_text, finish_text
+
+
+def _timing_phrase(state: _ProgressState) -> str:
+    elapsed_text, eta_text, finish_text = _progress_timing_text(state)
+    if eta_text is None:
+        return f"{elapsed_text} elapsed, ETA unknown"
+    return f"{elapsed_text} elapsed, ETA {eta_text} ({finish_text})"
+
+
+async def _progress_heartbeat(state: _ProgressState) -> None:
+    log = logger.get_logger()
+    while not state.done:
+        await asyncio.sleep(PROFILE_SEARCH_PROGRESS_HEARTBEAT_SECONDS)
+        if state.done:
+            break
+        log.status(_render_progress_line(state))
+
+
+def _emit_progress_status(
+    state: _ProgressState,
+    *,
+    idx: int,
+    skipped: int,
+    candidates: int,
+) -> None:
+    state.completed = idx
+    state.skipped = skipped
+    state.candidates = candidates
+    logger.get_logger().status(_render_progress_line(state))
 
 
 def _cross_upload_torrent_url(tracker: TrackerConfig, torrent_id: int) -> str:
@@ -92,6 +163,7 @@ async def _evaluate_profile_entry(
     opposite_tracker: TrackerConfig,
     source_client: GazelleServiceAdapter,
     target_client: GazelleServiceAdapter,
+    group_only: bool = False,
     candidate_resolver=None,
 ) -> tuple[list[tuple[str, int]], bool]:
     """Return candidate URLs and whether entry was skipped."""
@@ -155,6 +227,8 @@ async def _evaluate_profile_entry(
     )
     if not target_result:
         return _to_candidate_urls(source_tracker, [(entry.torrent_id, 100)]), False
+    if group_only:
+        return [], False
 
     if opposite_tracker.name.lower() == "red":
         target_gid = int(target_result.get("groupId"))
@@ -194,6 +268,7 @@ async def run_profile_list_search(
     source_tracker_key: str,
     list_type: ListType,
     entries: list[ProfileTorrent],
+    group_only: bool = False,
     output_dir: Path | None = None,
 ) -> ProfileSearchResult:
     source_key, source_tracker = resolve_profile_tracker(config, source_tracker_key)
@@ -206,18 +281,27 @@ async def run_profile_list_search(
     logger.info(f"Target tracker: {opposite_tracker.name.upper()}")
     logger.info(f"List: {list_type}")
     logger.info(f"Rows: {len(entries)}")
+    logger.info(f"Matching mode: {'Group-only' if group_only else 'Edition-aware'}")
 
     source_client = GazelleServiceAdapter(source_tracker)
     target_client = GazelleServiceAdapter(opposite_tracker)
     skipped = 0
     candidates: list[tuple[str, int]] = []
+    progress = _ProgressState(total=len(entries), started_at=time.monotonic())
+    heartbeat_task = asyncio.create_task(_progress_heartbeat(progress))
     try:
         total = len(entries)
         for idx, entry in enumerate(entries, start=1):
+            progress.current_index = idx
+            group_id = entry.group_id if entry.group_id is not None else "?"
+            torrent_id = entry.torrent_id if entry.torrent_id is not None else "?"
+            logger.info(f"[Task {idx}/{total}] {_timing_phrase(progress)}")
             logger.info(
-                f"[Task {idx} of {total}] group={entry.group_id} torrent={entry.torrent_id} "
-                f"{entry.group_name or ''}".strip()
+                f"   {source_tracker.name.lower()} group #{group_id} "
+                f"torrent #{torrent_id} '{entry.group_name or ''}'"
             )
+            entry_candidates: list[tuple[str, int]] = []
+            was_skipped = False
             try:
                 entry_candidates, was_skipped = await _evaluate_profile_entry(
                     entry,
@@ -225,24 +309,36 @@ async def run_profile_list_search(
                     opposite_tracker,
                     source_client,
                     target_client,
+                    group_only=group_only,
                 )
             except Exception as exc:  # pragma: no cover - guard for network/API errors
                 logger.warning(f"Entry failed: {exc}")
-                skipped += 1
-                continue
+                was_skipped = True
+
             if was_skipped:
                 skipped += 1
-                continue
-            if entry_candidates:
+            elif entry_candidates:
                 logger.info(
-                    f"  Missing on destination: {len(entry_candidates)} candidate(s) for source torrent {entry.torrent_id}"
+                    f"   Candidate found: {len(entry_candidates)} candidate(s) "
+                    f"for source torrent #{entry.torrent_id}"
                 )
                 candidates.extend(entry_candidates)
             else:
-                logger.info("  Destination already has this source torrent encoding (or equivalent)")
-            if idx < total:
+                logger.info("   Match found on target. Not a candidate.")
+
+            _emit_progress_status(
+                progress,
+                idx=idx,
+                skipped=skipped,
+                candidates=len(candidates),
+            )
+            if not was_skipped and idx < total:
                 await asyncio.sleep(0.01)
     finally:
+        progress.done = True
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        logger.get_logger().clear_status()
         await source_client.close()
         await target_client.close()
         logger.info(f"Output mirrored to {log_path}")

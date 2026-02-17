@@ -51,7 +51,7 @@ async def verify_gazelle_tracker(session, api_key: str, url: str, name: str, tim
         'User-Agent': UA,
     }
     api_url = f"{url}/ajax.php?action=index"
-    await enforce_gazelle_min_interval(url, tracker_name=name, auth_mode="api_key")
+    await enforce_gazelle_min_interval(url, tracker_name=name)
     
     async with session.get(
         api_url,

@@ -77,10 +77,9 @@ def test_adapter_wait_logging_emits_debug_always_but_info_only_above_threshold(m
         _base_url: str,
         min_interval_seconds: float = 2.0,
         tracker_name: str | None = None,
-        auth_mode: str = "api_key",
     ) -> float:
         _ = min_interval_seconds
-        _ = tracker_name, auth_mode
+        _ = tracker_name
         return 0.2
 
     monkeypatch.setattr(gazelle_client, "enforce_gazelle_min_interval", _wait_small)
@@ -93,10 +92,9 @@ def test_adapter_wait_logging_emits_debug_always_but_info_only_above_threshold(m
         _base_url: str,
         min_interval_seconds: float = 2.0,
         tracker_name: str | None = None,
-        auth_mode: str = "api_key",
     ) -> float:
         _ = min_interval_seconds
-        _ = tracker_name, auth_mode
+        _ = tracker_name
         return 1.9
 
     monkeypatch.setattr(gazelle_client, "enforce_gazelle_min_interval", _wait_big)
@@ -118,10 +116,9 @@ def test_search_mode_wait_logging_emits_debug_for_direct_fetch_helpers(monkeypat
         _base_url: str,
         min_interval_seconds: float = 2.0,
         tracker_name: str | None = None,
-        auth_mode: str = "api_key",
     ) -> float:
         _ = min_interval_seconds
-        _ = tracker_name, auth_mode
+        _ = tracker_name
         return 0.1
 
     monkeypatch.setattr(gazelle_client, "enforce_gazelle_min_interval", _wait_small)
@@ -134,10 +131,9 @@ def test_search_mode_wait_logging_emits_debug_for_direct_fetch_helpers(monkeypat
         _base_url: str,
         min_interval_seconds: float = 2.0,
         tracker_name: str | None = None,
-        auth_mode: str = "api_key",
     ) -> float:
         _ = min_interval_seconds
-        _ = tracker_name, auth_mode
+        _ = tracker_name
         return 1.8
 
     monkeypatch.setattr(gazelle_client, "enforce_gazelle_min_interval", _wait_big)

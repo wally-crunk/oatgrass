@@ -16,8 +16,8 @@ from oatgrass.profile.retriever import (
     ListType,
     ProfileRetriever,
     ProfileTorrent,
-    get_tracker_list_types,
 )
+from oatgrass.tracker_profile import resolve_tracker_profile
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ class ProfileMenuService:
         self._retriever = self._retriever_factory(tracker)
 
     async def fetch_all_lists(self) -> dict[ListType, list[ProfileTorrent]]:
-        list_types = get_tracker_list_types(self.tracker.name)
+        list_types = resolve_tracker_profile(self.tracker.name).list_types
         total_tasks = len(list_types)
         results: dict[ListType, list[ProfileTorrent]] = {}
         for idx, list_type in enumerate(list_types, start=1):

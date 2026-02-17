@@ -63,6 +63,7 @@ config.toml
 # Documentation (transmitted out of band)
 README.md
 CHANGELOG.md
+dev/post*.bb
 
 # Personal environments and ephemera
 .venv*/

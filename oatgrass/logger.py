@@ -16,6 +16,8 @@ class OatgrassLogger:
         self._start_time = datetime.now()
         self.debug_mode = debug
         self._rate_limit_note_trackers: set[str] = set()
+        self._status_active = False
+        self._status_len = 0
         
         if log_file:
             log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -30,10 +32,34 @@ class OatgrassLogger:
         
         welcome = f"({self._start_time.strftime('%H:%M:%S')}  Started Oatgrass {version})"
         self.log(welcome)
+
+    def _clear_status_line(self) -> None:
+        if not self._status_active:
+            return
+        clear = "\r" + (" " * self._status_len) + "\r"
+        print(clear, end="", flush=True)
+        sys.stdout.flush()
+        self._status_active = False
+        self._status_len = 0
+
+    def status(self, msg: str) -> None:
+        """Update single-line status in-place on screen only."""
+        rendered = msg.rstrip("\n")
+        padded_len = max(len(rendered), self._status_len)
+        padded = rendered + (" " * (padded_len - len(rendered)))
+        print("\r" + padded, end="", flush=True)
+        sys.stdout.flush()
+        self._status_active = True
+        self._status_len = padded_len
+
+    def clear_status(self) -> None:
+        """Clear in-place status line, if any."""
+        self._clear_status_line()
     
     def log(self, msg: str, prefix: str = ""):
         """Log to screen and file"""
         output = f"{prefix}{msg}" if prefix else msg
+        self._clear_status_line()
         
         # Screen (unbuffered)
         print(output, flush=True)
@@ -112,6 +138,7 @@ class OatgrassLogger:
     
     def close(self):
         """Close file handle with goodbye message"""
+        self._clear_status_line()
         if self._file_handle:
             end_time = datetime.now()
             elapsed = end_time - self._start_time

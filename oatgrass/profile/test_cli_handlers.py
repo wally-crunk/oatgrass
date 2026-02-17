@@ -43,7 +43,7 @@ def _seeded_session_state(entry: ProfileTorrent):
             super().__init__()
             self.set_snapshot(
                 "ops",
-                {"snatched": [entry], "uploaded": [], "downloaded": []},
+                {"snatched": [entry], "uploaded": [], "seeding": [], "leeching": []},
             )
 
     return _SeededSessionState
@@ -61,19 +61,20 @@ def _load_cli_module(monkeypatch: pytest.MonkeyPatch):
     ("raw_choice", "expected"),
     [
         ("U", "uploaded"),
-        ("D", "downloaded"),
-        ("S", "snatched"),
-        ("alpha", "snatched"),
-        ("", "snatched"),
+        ("L", "leeching"),
+        ("snatched", "snatched"),
+        ("A", "all"),
+        ("alpha", None),
+        ("", None),
     ],
 )
 def test_prompt_profile_list_choice_handles_good_bad_null_inputs(
-    monkeypatch: pytest.MonkeyPatch, raw_choice: str, expected: str
+    monkeypatch: pytest.MonkeyPatch, raw_choice: str, expected: str | None
 ) -> None:
     cli = _load_cli_module(monkeypatch)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: raw_choice)
 
-    available = ["snatched", "uploaded", "downloaded"]
+    available = ["seeding", "leeching", "uploaded", "snatched"]
     assert cli._prompt_profile_list_choice(available) == expected
 
 
@@ -119,7 +120,7 @@ def test_ensure_cache_for_followup_action_decline_refetch(monkeypatch: pytest.Mo
     ok = cli._ensure_cache_for_followup_action(
         _config(),
         cache=cache,
-        list_type="snatched",
+        list_types=["snatched"],
         option_choice="M",
         tracker_key="ops",
     )
@@ -133,17 +134,17 @@ def test_ensure_cache_for_followup_action_refetches_and_sets_cache(
     cli = _load_cli_module(monkeypatch)
     cache = ProfileSessionState()
     monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "Y")
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "F")
 
     async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
-        return "ops", {"snatched": [_entry()], "uploaded": [], "downloaded": []}
+        return "ops", {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []}
 
     monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
 
     ok = cli._ensure_cache_for_followup_action(
         _config(),
         cache=cache,
-        list_type="snatched",
+        list_types=["snatched"],
         option_choice="M",
         tracker_key="ops",
     )
@@ -157,17 +158,89 @@ def test_ensure_cache_for_followup_action_false_when_requested_list_stays_empty(
     cli = _load_cli_module(monkeypatch)
     cache = ProfileSessionState()
     monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "Y")
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "F")
 
     async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
-        return "ops", {"snatched": [], "uploaded": [_entry(list_type="uploaded")], "downloaded": []}
+        return "ops", {"snatched": [], "uploaded": [_entry(list_type="uploaded")], "seeding": [], "leeching": []}
 
     monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
 
     ok = cli._ensure_cache_for_followup_action(
         _config(),
         cache=cache,
-        list_type="snatched",
+        list_types=["snatched"],
+        option_choice="M",
+        tracker_key="ops",
+    )
+    assert ok is False
+
+
+def test_ensure_cache_for_followup_action_uses_cached_without_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _load_cli_module(monkeypatch)
+    cache = ProfileSessionState()
+    cache.set_snapshot("ops", {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []})
+    monkeypatch.setattr(cli, "_prompt_profile_source_choice", lambda _default: "cached")
+
+    called = {"summary": False}
+
+    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+        called["summary"] = True
+        return "ops", {"snatched": [_entry()]}
+
+    monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
+
+    ok = cli._ensure_cache_for_followup_action(
+        _config(),
+        cache=cache,
+        list_types=["snatched"],
+        option_choice="M",
+        tracker_key="ops",
+    )
+    assert ok is True
+    assert called["summary"] is False
+
+
+def test_ensure_cache_for_followup_action_loads_from_disk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _load_cli_module(monkeypatch)
+    cache = ProfileSessionState()
+    monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli.Prompt,
+        "ask",
+        lambda label, **_kwargs: "/tmp/fake.profile-lists.json" if label == "Profile list JSON path" else "L",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_profile_lists_from_disk",
+        lambda *_args, **_kwargs: {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []},
+    )
+
+    ok = cli._ensure_cache_for_followup_action(
+        _config(),
+        cache=cache,
+        list_types=["snatched"],
+        option_choice="M",
+        tracker_key="ops",
+    )
+    assert ok is True
+    assert cache.has_list("ops", "snatched")
+
+
+def test_ensure_cache_for_followup_action_invalid_source_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _load_cli_module(monkeypatch)
+    cache = ProfileSessionState()
+    monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "Z")
+    ok = cli._ensure_cache_for_followup_action(
+        _config(),
+        cache=cache,
+        list_types=["snatched"],
         option_choice="M",
         tracker_key="ops",
     )
@@ -182,14 +255,15 @@ def test_main_menu_option_two_delegates_to_profile_search(
     cli = _load_cli_module(monkeypatch)
     seeded_entry = _entry()
 
-    prompts = iter([menu_choice, "ops", "", "Y", "", "Q"])
+    prompts = iter([menu_choice, "ops", "snatched", "C", "Y", "", "Q"])
     delegated: dict[str, object] = {}
     rendered: dict[str, object] = {}
 
-    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries):
+    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries, group_only=False):
         delegated["source_tracker_key"] = source_tracker_key
         delegated["list_type"] = list_type
         delegated["entries"] = list(entries)
+        delegated["group_only"] = group_only
         delegated["config"] = config
         return SimpleNamespace(candidate_urls=[("https://ops/torrents.php?torrentid=22", 10)], processed=1, skipped=0)
 
@@ -224,10 +298,10 @@ def test_main_menu_option_two_can_abort_after_estimate(
     cli = _load_cli_module(monkeypatch)
     seeded_entry = _entry()
 
-    prompts = iter([menu_choice, "ops", "", "c", "", "Q"])
+    prompts = iter([menu_choice, "ops", "snatched", "C", "c", "", "Q"])
     delegated = {"called": False}
 
-    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries):
+    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries, group_only=False):
         delegated["called"] = True
         return SimpleNamespace(candidate_urls=[], processed=0, skipped=0)
 
@@ -253,11 +327,11 @@ def test_main_menu_option_two_warns_when_scipy_missing(
     lines: list[str] = []
     delegated = {"called": False}
 
-    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries):
+    async def _fake_profile_search(*, config, source_tracker_key, list_type, entries, group_only=False):
         delegated["called"] = True
         return SimpleNamespace(candidate_urls=[], processed=0, skipped=0)
 
-    prompts = iter([menu_choice, "ops", "", "", "Q"])
+    prompts = iter([menu_choice, "ops", "snatched", "C", "N", "", "Q"])
     monkeypatch.setattr(cli, "ProfileSessionState", _seeded_session_state(seeded_entry))
     monkeypatch.setattr(cli, "_has_scipy", lambda: False)
     monkeypatch.setattr(cli, "run_profile_list_search", _fake_profile_search)
@@ -269,7 +343,7 @@ def test_main_menu_option_two_warns_when_scipy_missing(
     cli.main_menu(_config())
 
     assert delegated["called"] is False
-    assert any("option 2/M requires edition-aware matching" in line for line in lines)
+    assert any("edition-aware matching is unavailable for option 2/M" in line for line in lines)
 
 
 @pytest.mark.parametrize("menu_choice", ["G", "1"])
@@ -279,11 +353,11 @@ def test_main_menu_option_one_accepts_letter_or_number(
 ) -> None:
     cli = _load_cli_module(monkeypatch)
     calls = {"summary_called": 0}
-    prompts = iter([menu_choice, "ops", "", "Q"])
+    prompts = iter([menu_choice, "ops", "snatched", "Q"])
 
     async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
         calls["summary_called"] += 1
-        return "ops", {"snatched": [_entry()], "uploaded": [], "downloaded": []}
+        return "ops", {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []}
 
     monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
     monkeypatch.setattr(cli, "display_config_table", lambda *_args, **_kwargs: None)

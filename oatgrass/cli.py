@@ -15,7 +15,7 @@ try:
     from rich.console import Console
     from rich.prompt import Prompt
     from rich.table import Table
-    from typing import Optional
+    from typing import Literal, Optional, cast
     import oatgrass as pkg
     from .config import OatgrassConfig, TrackerConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
@@ -25,12 +25,12 @@ try:
         ListType,
         ProfileTorrent,
         format_list_label,
-        get_tracker_list_types,
     )
     from .profile.search_service import run_profile_list_search
     from .profile.session_state import ProfileSessionState
     from .profile.tracker_selection import configured_profile_trackers, resolve_profile_tracker
     from .search.search_mode import run_search_mode, _next_run_path
+    from .tracker_profile import resolve_tracker_profile
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install required dependencies: pip install -r requirements.txt")
@@ -145,10 +145,14 @@ def _has_scipy() -> bool:
 def _warn_missing_scipy_startup() -> None:
     if _has_scipy():
         return
-    _ui_warn(
+    _warn_missing_scipy(
         "scipy not found: edition-aware matching is unavailable. "
         "Group-only mode remains available."
     )
+
+
+def _warn_missing_scipy(message: str) -> None:
+    _ui_warn(message)
     _warn_missing_scipy_hint()
 
 
@@ -156,7 +160,7 @@ def _warn_missing_scipy_hint() -> None:
     global _SCIPY_HINT_EMITTED
     if _SCIPY_HINT_EMITTED:
         return
-    _ui_warn("Suggestion: Set up a venv, then run `source venv/bin/activate`.")
+    _ui_warn("1. Try `source venv/bin/activate` before launching.")
     _SCIPY_HINT_EMITTED = True
 
 
@@ -251,19 +255,26 @@ def _handle_main_menu_choice(config: OatgrassConfig, cache: ProfileSessionState,
     return True
 
 
+ProfileListSelection = ListType | Literal["all"]
+
+
 def _select_profile_list_action(
     config: OatgrassConfig,
     cache: ProfileSessionState,
     option_choice: str,
-) -> tuple[str, TrackerConfig, ListType] | None:
+) -> tuple[str, TrackerConfig, list[ListType]] | None:
     tracker_key = _prompt_source_tracker_choice(config, cache.tracker_key)
     tracker_key, tracker = resolve_profile_tracker(config, tracker_key)
-    available_list_types = list(get_tracker_list_types(tracker.name))
-    list_type = _prompt_profile_list_choice(available_list_types)
-    if not _ensure_cache_for_followup_action(config, cache, list_type, option_choice, tracker_key):
+    available_list_types = cast(list[ListType], list(resolve_tracker_profile(tracker.name).list_types))
+    list_choice = _prompt_profile_list_choice(available_list_types)
+    if list_choice is None:
         _ui_prompt("Press Enter to continue", default="")
         return None
-    return tracker_key, tracker, list_type
+    selected_lists = available_list_types if list_choice == "all" else [list_choice]
+    if not _ensure_cache_for_followup_action(config, cache, selected_lists, option_choice, tracker_key):
+        _ui_prompt("Press Enter to continue", default="")
+        return None
+    return tracker_key, tracker, selected_lists
 
 
 def _handle_profile_summary_action(config: OatgrassConfig, cache: ProfileSessionState) -> None:
@@ -283,31 +294,54 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
     if selected is None:
         return
 
-    tracker_key, _tracker, list_type = selected
+    tracker_key, _tracker, list_types = selected
+    group_only_mode = False
     if not _has_scipy():
-        _ui_warn(
-            "scipy not found: option 2/M requires edition-aware matching. "
-            "Use option S in Group-only mode or install scipy."
-        )
-        _warn_missing_scipy_hint()
+        _warn_missing_scipy("scipy not found: edition-aware matching is unavailable for option 2/M.")
+        if not _ui_prompt_yesno(
+            "2. Proceed without edition-aware matching (group-only mode)?",
+            default_yes=False,
+            allow_cancel=True,
+        ):
+            _ui_prompt("Press Enter to continue", default="")
+            return
+        group_only_mode = True
+
+    selected_with_rows = [list_type for list_type in list_types if cache.has_list(tracker_key, list_type)]
+    if not selected_with_rows:
+        _ui_warn("Selected profile list(s) have no cached rows.")
         _ui_prompt("Press Enter to continue", default="")
         return
 
-    entries = cache.lists.get(list_type, [])
-    _show_profile_search_estimate(config, tracker_key, list_type, len(entries))
+    if len(selected_with_rows) > 1:
+        _ui_info(f"Selected lists: {', '.join(selected_with_rows)}")
+    total_rows = sum(len(cache.get_list(tracker_key, list_type)) for list_type in selected_with_rows)
+    _show_profile_search_estimate(config, tracker_key, selected_with_rows[0], total_rows)
     if not _ui_prompt_yesno("Continue profile search?", default_yes=True, allow_cancel=True):
         _ui_prompt("Press Enter to continue", default="")
         return
 
-    result = asyncio.run(
-        run_profile_list_search(
-            config=config,
-            source_tracker_key=tracker_key,
-            list_type=list_type,
-            entries=entries,
+    total_processed = 0
+    total_skipped = 0
+    all_candidates: list[tuple[str, int]] = []
+    for list_type in selected_with_rows:
+        entries = cache.get_list(tracker_key, list_type)
+        _ui_info(f"Running profile search for '{list_type}' ({len(entries)} row(s))")
+        result = asyncio.run(
+            run_profile_list_search(
+                config=config,
+                source_tracker_key=tracker_key,
+                list_type=list_type,
+                entries=entries,
+                group_only=group_only_mode,
+            )
         )
-    )
-    _display_profile_search_result(result.candidate_urls, result.processed, result.skipped)
+        total_processed += result.processed
+        total_skipped += result.skipped
+        all_candidates.extend(result.candidate_urls)
+
+    deduped_candidates = list(dict.fromkeys(all_candidates))
+    _display_profile_search_result(deduped_candidates, total_processed, total_skipped)
     _ui_prompt("Press Enter to continue", default="")
 
 
@@ -354,7 +388,9 @@ def _persist_profile_lists(
     return json_path
 
 
-def _prompt_profile_list_choice(available_lists: list[ListType]) -> ListType:
+def _prompt_profile_list_choice(
+    available_lists: list[ListType],
+) -> ProfileListSelection | None:
     if not available_lists:
         raise ValueError("No available profile lists to choose from.")
 
@@ -362,10 +398,13 @@ def _prompt_profile_list_choice(available_lists: list[ListType]) -> ListType:
     for idx, list_type in enumerate(available_lists, start=1):
         label = format_list_label(list_type)
         console.print(f"  [{idx}] {label} ({list_type})")
+    console.print("  [A] All lists")
 
-    choice = _ui_prompt("List", default="1").strip().lower()
+    choice = _ui_prompt("List").strip().lower()
     if choice.isdigit() and 1 <= int(choice) <= len(available_lists):
         return available_lists[int(choice) - 1]
+    if choice in {"a", "all"}:
+        return "all"
 
     aliases: dict[str, ListType] = {}
     for list_type in available_lists:
@@ -376,28 +415,128 @@ def _prompt_profile_list_choice(available_lists: list[ListType]) -> ListType:
         aliases.setdefault(label[0], list_type)
     if choice in aliases:
         return aliases[choice]
-    return available_lists[0]
+    _ui_warn("Invalid profile list choice.")
+    return None
 
 
 def _ensure_cache_for_followup_action(
     config: OatgrassConfig,
     cache: ProfileSessionState,
-    list_type: ListType,
+    list_types: list[ListType],
     option_choice: str,
     tracker_key: str,
 ) -> bool:
     _, tracker = resolve_profile_tracker(config, tracker_key)
-    if cache.has_list(tracker_key, list_type):
+
+    default_source = "C" if any(cache.has_list(tracker_key, list_type) for list_type in list_types) else "F"
+    source = _prompt_profile_source_choice(default_source)
+    if source is None:
+        return False
+    if source == "cached":
+        if not any(cache.has_list(tracker_key, list_type) for list_type in list_types):
+            joined = ", ".join(list_types)
+            _ui_warn(
+                f"No cached rows found for selected list(s) [{joined}] on {tracker.name.upper()} for option {option_choice}."
+            )
+            return False
         return True
-    _ui_warn(f"No cached '{list_type}' data found for {tracker.name.upper()} for option {option_choice}.")
-    if not _ui_prompt_yesno("Fetch profile lists now?", default_yes=True):
+    if source == "fetch":
+        tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
+        cache.set_snapshot(tracker_key, lists)
+    else:  # source == "disk"
+        path_raw = _ui_prompt("Profile list JSON path").strip()
+        if not path_raw:
+            _ui_warn("Path is required.")
+            return False
+        try:
+            loaded = _load_profile_lists_from_disk(
+                Path(path_raw).expanduser(),
+                tracker_name=tracker.name.upper(),
+                allowed_list_types=resolve_tracker_profile(tracker.name).list_types,
+            )
+        except ValueError as exc:
+            _ui_warn(f"Invalid profile list format: {exc}")
+            return False
+        cache.set_snapshot(tracker_key, loaded)
+        _ui_info("Profile lists loaded from disk.")
+
+    available = [list_type for list_type in list_types if cache.has_list(tracker_key, list_type)]
+    if not available:
+        joined = ", ".join(list_types)
+        _ui_warn(f"Selected list(s) [{joined}] are empty after source selection.")
         return False
-    tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
-    cache.set_snapshot(tracker_key, lists)
-    if not cache.has_list(tracker_key, list_type):
-        _ui_warn(f"Requested list '{list_type}' is empty after fetch.")
-        return False
+    missing = [list_type for list_type in list_types if list_type not in available]
+    if missing:
+        _ui_warn(f"Some selected lists are empty and will be skipped: {', '.join(missing)}")
     return True
+
+
+def _prompt_profile_source_choice(default: str) -> str | None:
+    console.print("\nProfile source:")
+    console.print("  [F] Fetch now")
+    console.print("  [C] Use cached")
+    console.print("  [L] Load from disk")
+    choice = _ui_prompt("Source", default=default).strip().lower()
+    if choice in {"f", "fetch"}:
+        return "fetch"
+    if choice in {"c", "cached", "cache"}:
+        return "cached"
+    if choice in {"l", "load", "disk"}:
+        return "disk"
+    _ui_warn("Invalid profile source choice.")
+    return None
+
+
+def _load_profile_lists_from_disk(
+    path: Path,
+    *,
+    tracker_name: str,
+    allowed_list_types: tuple[str, ...],
+) -> dict[ListType, list[ProfileTorrent]]:
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        raise ValueError(f"Failed to read JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Root must be an object")
+    payload_tracker = payload.get("tracker")
+    if not isinstance(payload_tracker, str) or payload_tracker.upper() != tracker_name.upper():
+        raise ValueError(f"Snapshot tracker must match '{tracker_name}'")
+    raw_lists = payload.get("lists")
+    if not isinstance(raw_lists, dict):
+        raise ValueError("Missing 'lists' object")
+
+    parsed: dict[ListType, list[ProfileTorrent]] = {}
+    allowed = set(allowed_list_types)
+    for list_name, rows in raw_lists.items():
+        if list_name not in allowed:
+            raise ValueError(f"Unknown list type '{list_name}'")
+        if not isinstance(rows, list):
+            raise ValueError(f"List '{list_name}' must be an array")
+        parsed_rows: list[ProfileTorrent] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValueError(f"List '{list_name}' entry {idx} must be an object")
+            try:
+                entry = ProfileTorrent(**row)
+            except TypeError as exc:
+                raise ValueError(f"List '{list_name}' entry {idx} has unexpected schema") from exc
+            if entry.tracker.upper() != tracker_name.upper():
+                raise ValueError(f"List '{list_name}' entry {idx} tracker mismatch")
+            if entry.list_type != list_name:
+                raise ValueError(f"List '{list_name}' entry {idx} list_type mismatch")
+            if not isinstance(entry.metadata, dict):
+                raise ValueError(f"List '{list_name}' entry {idx} metadata must be an object")
+            if entry.group_id is None and entry.torrent_id is None:
+                raise ValueError(f"List '{list_name}' entry {idx} missing both group_id and torrent_id")
+            parsed_rows.append(entry)
+        parsed[cast(ListType, list_name)] = parsed_rows
+
+    for list_name in allowed_list_types:
+        parsed.setdefault(cast(ListType, list_name), [])
+    return parsed
 
 
 def _prompt_source_tracker_choice(config: OatgrassConfig, cached_tracker: str | None) -> str:
@@ -471,8 +610,7 @@ def _run_search_mode_prompt(config: OatgrassConfig) -> None:
         )
         basic = matching_choice == "G"
     else:
-        _ui_warn("scipy not found: matching mode is fixed to Group-only for this run.")
-        _warn_missing_scipy_hint()
+        _warn_missing_scipy("scipy not found: matching mode is fixed to Group-only for this run.")
         basic = True
 
     fallback_choice = _prompt_menu_choice(
@@ -629,8 +767,7 @@ def main():
             output_dir = Path(args.output).expanduser() if args.output else Path("output")
             basic_mode = args.search_groups
             if not basic_mode and not _has_scipy():
-                _ui_warn("scipy not found: falling back to --search-groups for this run.")
-                _warn_missing_scipy_hint()
+                _warn_missing_scipy("scipy not found: falling back to --search-groups for this run.")
                 basic_mode = True
             
             asyncio.run(

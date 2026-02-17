@@ -42,7 +42,6 @@ class GazelleServiceAdapter(GazelleClient):
         self.base_url = tracker.url.rstrip("/")
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._min_interval_seconds = max(0.0, float(min_interval_seconds))
-        self._auth_mode = "api_key"
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
 
@@ -180,7 +179,6 @@ class GazelleServiceAdapter(GazelleClient):
             self.base_url,
             min_interval_seconds=self._min_interval_seconds,
             tracker_name=self.tracker.name,
-            auth_mode=self._auth_mode,
         )
         log = logger.get_logger()
         log.api_wait_debug(self.tracker.name.upper(), wait)

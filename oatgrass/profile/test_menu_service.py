@@ -5,6 +5,7 @@ from aiohttp import ClientResponseError, RequestInfo
 from multidict import CIMultiDict
 from rich.console import Console
 from yarl import URL
+from types import SimpleNamespace
 
 from oatgrass.config import TrackerConfig
 from oatgrass.profile.menu_service import (
@@ -92,8 +93,8 @@ async def test_menu_service_fetches_all_lists_with_task_counters(
             self.closed = True
 
     monkeypatch.setattr(
-        "oatgrass.profile.menu_service.get_tracker_list_types",
-        lambda _: ["snatched", "uploaded", "downloaded"],
+        "oatgrass.profile.menu_service.resolve_tracker_profile",
+        lambda _: SimpleNamespace(list_types=("snatched", "uploaded", "downloaded")),
     )
     tracker = TrackerConfig(name="OPS", url="https://orpheus.network", api_key="token")
     service = ProfileMenuService(tracker, retriever_factory=_FakeRetriever)
@@ -137,12 +138,12 @@ async def test_menu_service_handles_client_response_errors(
         async def close(self):
             self.closed = True
 
-    def _list_types(_tracker_name: str) -> list[str]:
-        return ["downloaded", "snatched"]
+    def _resolve(_tracker_name: str) -> SimpleNamespace:
+        return SimpleNamespace(list_types=("downloaded", "snatched"))
 
     monkeypatch.setattr(
-        "oatgrass.profile.menu_service.get_tracker_list_types",
-        _list_types,
+        "oatgrass.profile.menu_service.resolve_tracker_profile",
+        _resolve,
     )
 
     tracker = TrackerConfig(name="RED", url="https://redacted.sh", api_key="token")

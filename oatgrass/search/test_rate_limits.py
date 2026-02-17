@@ -19,8 +19,8 @@ async def test_gazelle_rate_limit_waits_for_same_server(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(rate_limits.asyncio, "sleep", _fake_sleep)
 
-    first_wait = await rate_limits.enforce_gazelle_min_interval("https://redacted.sh/")
-    second_wait = await rate_limits.enforce_gazelle_min_interval("https://REDActed.sh")
+    first_wait = await rate_limits.enforce_gazelle_min_interval("https://redacted.sh/", tracker_name="red")
+    second_wait = await rate_limits.enforce_gazelle_min_interval("https://REDActed.sh", tracker_name="RED")
 
     assert first_wait == 0.0
     assert second_wait == pytest.approx(rate_limits.GAZELLE_MIN_INTERVAL_SECONDS)
@@ -43,9 +43,16 @@ async def test_gazelle_rate_limit_does_not_cross_throttle_servers(
 
     monkeypatch.setattr(rate_limits.asyncio, "sleep", _fake_sleep)
 
-    red_wait = await rate_limits.enforce_gazelle_min_interval("https://redacted.sh")
-    ops_wait = await rate_limits.enforce_gazelle_min_interval("https://orpheus.network")
+    red_wait = await rate_limits.enforce_gazelle_min_interval("https://redacted.sh", tracker_name="red")
+    ops_wait = await rate_limits.enforce_gazelle_min_interval("https://orpheus.network", tracker_name="ops")
 
     assert red_wait == 0.0
     assert ops_wait == 0.0
     assert waits == []
+
+
+def test_resolve_tracker_request_limit_normalizes_inputs() -> None:
+    assert rate_limits._resolve_tracker_request_limit(" RED ") == 10
+    assert rate_limits._resolve_tracker_request_limit("ops") == 5
+    with pytest.raises(ValueError, match="Unsupported tracker"):
+        rate_limits._resolve_tracker_request_limit("unknown")

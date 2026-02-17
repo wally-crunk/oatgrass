@@ -7,6 +7,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from oatgrass.tracker_profile import resolve_tracker_profile
+
 # Gazelle trackers (RED/OPS): minimum interval between calls to the same server.
 GAZELLE_MIN_INTERVAL_SECONDS = 2.0
 GAZELLE_WAIT_LOG_THRESHOLD_SECONDS = 1.75
@@ -17,13 +19,6 @@ DISCOGS_MIN_INTERVAL_SECONDS = 2.4
 DISCOGS_MAX_CONCURRENT_REQUESTS = 25
 
 
-_GAZELLE_TRACKER_REQUEST_LIMITS: dict[tuple[str, str], int] = {
-    ("red", "api_key"): 10,
-    ("red", "standard"): 5,
-    ("ops", "api_key"): 5,
-}
-
-
 @dataclass
 class _GazelleBucket:
     lock: asyncio.Lock
@@ -31,7 +26,7 @@ class _GazelleBucket:
     request_starts: deque[float] = field(default_factory=deque)
 
 
-_gazelle_buckets: dict[tuple[str, str], _GazelleBucket] = {}
+_gazelle_buckets: dict[str, _GazelleBucket] = {}
 _gazelle_buckets_lock = asyncio.Lock()
 
 
@@ -39,14 +34,8 @@ def _normalize_server_key(base_url: str) -> str:
     return base_url.rstrip("/").lower()
 
 
-def _normalize_auth_mode(auth_mode: str) -> str:
-    return (auth_mode or "api_key").strip().lower()
-
-
-def _resolve_tracker_request_limit(tracker_name: str | None, auth_mode: str) -> int | None:
-    if not tracker_name:
-        return None
-    return _GAZELLE_TRACKER_REQUEST_LIMITS.get((tracker_name.strip().lower(), _normalize_auth_mode(auth_mode)))
+def _resolve_tracker_request_limit(tracker_name: str) -> int | None:
+    return resolve_tracker_profile(tracker_name).request_limit
 
 
 def _prune_window(bucket: _GazelleBucket, now: float, window_seconds: float) -> None:
@@ -58,8 +47,8 @@ def _prune_window(bucket: _GazelleBucket, now: float, window_seconds: float) -> 
         bucket.request_starts.popleft()
 
 
-async def _get_or_create_bucket(base_url: str, auth_mode: str) -> _GazelleBucket:
-    key = (_normalize_server_key(base_url), _normalize_auth_mode(auth_mode))
+async def _get_or_create_bucket(base_url: str) -> _GazelleBucket:
+    key = _normalize_server_key(base_url)
     bucket = _gazelle_buckets.get(key)
     if bucket is not None:
         return bucket
@@ -74,17 +63,16 @@ async def _get_or_create_bucket(base_url: str, auth_mode: str) -> _GazelleBucket
 
 async def enforce_gazelle_min_interval(
     base_url: str,
+    tracker_name: str,
     min_interval_seconds: float = GAZELLE_MIN_INTERVAL_SECONDS,
-    tracker_name: str | None = None,
-    auth_mode: str = "api_key",
 ) -> float:
     """
     Enforce shared per-server Gazelle spacing.
 
     Returns the wait time applied (seconds).
     """
-    bucket = await _get_or_create_bucket(base_url, auth_mode)
-    request_limit = _resolve_tracker_request_limit(tracker_name, auth_mode)
+    bucket = await _get_or_create_bucket(base_url)
+    request_limit = _resolve_tracker_request_limit(tracker_name)
     window_seconds = GAZELLE_RATE_LIMIT_WINDOW_SECONDS if request_limit else 0.0
     async with bucket.lock:
         now = time.monotonic()
