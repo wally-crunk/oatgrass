@@ -110,6 +110,37 @@ async def test_menu_service_fetches_all_lists_with_task_counters(
 
 
 @pytest.mark.asyncio
+async def test_menu_service_fetches_selected_lists_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int, int]] = []
+
+    class _FakeRetriever:
+        def __init__(self, _tracker: TrackerConfig) -> None:
+            self.closed = False
+
+        async def fetch(self, list_type, task_index=1, task_total=1):
+            calls.append((list_type, task_index, task_total))
+            return [_entry(list_type, 100)]
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "oatgrass.profile.menu_service.resolve_tracker_profile",
+        lambda _: SimpleNamespace(list_types=("seeding", "leeching", "uploaded", "snatched")),
+    )
+
+    tracker = TrackerConfig(name="OPS", url="https://orpheus.network", api_key="token")
+    service = ProfileMenuService(tracker, retriever_factory=_FakeRetriever)
+    results = await service.fetch_all_lists(["leeching"])
+    await service.close()
+
+    assert set(results) == {"leeching"}
+    assert calls == [("leeching", 1, 1)]
+
+
+@pytest.mark.asyncio
 async def test_menu_service_handles_client_response_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

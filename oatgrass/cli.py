@@ -142,15 +142,6 @@ def _has_scipy() -> bool:
     return _SCIPY_AVAILABLE
 
 
-def _warn_missing_scipy_startup() -> None:
-    if _has_scipy():
-        return
-    _warn_missing_scipy(
-        "scipy not found: edition-aware matching is unavailable. "
-        "Group-only mode remains available."
-    )
-
-
 def _warn_missing_scipy(message: str) -> None:
     _ui_warn(message)
     _warn_missing_scipy_hint()
@@ -175,8 +166,12 @@ def redact_api_key(key: str) -> str:
 
 def display_config_table(config: OatgrassConfig):
     """Display current API key configuration status"""
-    _ui_info(f"✓ Read configuration file \"{config.config_path}\"... ok!")
-    _ui_info("To edit configuration, modify config.toml directly.")
+    _ui_info(f'Config loaded: "{config.config_path}"')
+    if not _has_scipy():
+        _ui_warn(
+            "scipy not found: edition-aware matching is unavailable. "
+            "Try `source venv/bin/activate` before launching."
+        )
 
     table = Table(title="API configuration")
     table.add_column("Service", style="cyan")
@@ -360,11 +355,15 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
     _ui_prompt("Press Enter to continue", default="")
 
 
-async def _run_profile_summary_menu(config: OatgrassConfig, tracker_key: str | None = None):
+async def _run_profile_summary_menu(
+    config: OatgrassConfig,
+    tracker_key: str | None = None,
+    list_types: list[ListType] | None = None,
+):
     tracker_key, tracker = resolve_profile_tracker(config, tracker_key)
     service = ProfileMenuService(tracker)
     try:
-        lists = await service.fetch_all_lists()
+        lists = await service.fetch_all_lists(list_types)
         summaries = [build_profile_summary(list_type, entries) for list_type, entries in lists.items()]
         render_profile_summaries(console, tracker.name.upper(), summaries)
         saved_path = _persist_profile_lists(lists, tracker.name.upper())
@@ -453,7 +452,9 @@ def _ensure_cache_for_followup_action(
             return False
         return True
     if source == "fetch":
-        tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
+        tracker_key, lists = asyncio.run(
+            _run_profile_summary_menu(config, tracker_key=tracker_key, list_types=list_types)
+        )
         cache.set_snapshot(tracker_key, lists)
 
     available = [list_type for list_type in list_types if cache.has_list(tracker_key, list_type)]
@@ -781,7 +782,6 @@ def main():
 
         config_path = resolve_config_path(args.config)
         config = load_config(config_path)
-        _warn_missing_scipy_startup()
         
         if args.url_or_id:
             # Check for conflicting flags

@@ -120,7 +120,9 @@ def test_ensure_cache_for_followup_action_decline_refetch(monkeypatch: pytest.Mo
 
     called: list[tuple[str | None]] = []
 
-    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+    async def _fake_summary_menu(
+        _config: OatgrassConfig, tracker_key: str | None = None, list_types: list[str] | None = None
+    ):
         called.append((tracker_key,))
         return "ops", {"snatched": [_entry()]}
 
@@ -144,7 +146,13 @@ def test_ensure_cache_for_followup_action_refetches_and_sets_cache(
     monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "F")
 
-    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+    captured: dict[str, object] = {}
+
+    async def _fake_summary_menu(
+        _config: OatgrassConfig, tracker_key: str | None = None, list_types: list[str] | None = None
+    ):
+        captured["tracker_key"] = tracker_key
+        captured["list_types"] = list_types
         return "ops", {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []}
 
     monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
@@ -157,6 +165,8 @@ def test_ensure_cache_for_followup_action_refetches_and_sets_cache(
     )
     assert ok is True
     assert cache.has_list("ops", "snatched")
+    assert captured["tracker_key"] == "ops"
+    assert captured["list_types"] == ["snatched"]
 
 
 def test_ensure_cache_for_followup_action_false_when_requested_list_stays_empty(
@@ -167,7 +177,9 @@ def test_ensure_cache_for_followup_action_false_when_requested_list_stays_empty(
     monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "F")
 
-    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+    async def _fake_summary_menu(
+        _config: OatgrassConfig, tracker_key: str | None = None, list_types: list[str] | None = None
+    ):
         return "ops", {"snatched": [], "uploaded": [_entry(list_type="uploaded")], "seeding": [], "leeching": []}
 
     monkeypatch.setattr(cli, "_run_profile_summary_menu", _fake_summary_menu)
@@ -191,7 +203,9 @@ def test_ensure_cache_for_followup_action_uses_cached_without_fetch(
 
     called = {"summary": False}
 
-    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+    async def _fake_summary_menu(
+        _config: OatgrassConfig, tracker_key: str | None = None, list_types: list[str] | None = None
+    ):
         called["summary"] = True
         return "ops", {"snatched": [_entry()]}
 
@@ -392,7 +406,9 @@ def test_main_menu_option_one_accepts_letter_or_number(
     calls = {"summary_called": 0}
     prompts = iter([menu_choice, "ops", "snatched", "Q"])
 
-    async def _fake_summary_menu(_config: OatgrassConfig, tracker_key: str | None = None):
+    async def _fake_summary_menu(
+        _config: OatgrassConfig, tracker_key: str | None = None, list_types: list[str] | None = None
+    ):
         calls["summary_called"] += 1
         return "ops", {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []}
 

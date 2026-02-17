@@ -80,11 +80,11 @@ class ProfileMenuService:
         self._retriever_factory = retriever_factory or ProfileRetriever
         self._retriever = self._retriever_factory(tracker)
 
-    async def fetch_all_lists(self) -> dict[ListType, list[ProfileTorrent]]:
-        list_types = resolve_tracker_profile(self.tracker.name).list_types
-        total_tasks = len(list_types)
+    async def fetch_all_lists(self, list_types: Iterable[ListType] | None = None) -> dict[ListType, list[ProfileTorrent]]:
+        selected = tuple(list_types) if list_types is not None else resolve_tracker_profile(self.tracker.name).list_types
+        total_tasks = len(selected)
         results: dict[ListType, list[ProfileTorrent]] = {}
-        for idx, list_type in enumerate(list_types, start=1):
+        for idx, list_type in enumerate(selected, start=1):
             try:
                 results[list_type] = await self._retriever.fetch(
                     list_type,
