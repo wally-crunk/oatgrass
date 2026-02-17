@@ -113,9 +113,9 @@ async def process_entry_edition_aware(
     if candidates:
         urls_with_priority = [(f"{source_tracker.url.rstrip('/')}/torrents.php?torrentid={c.source_torrent.torrent_id}", c.priority) for c in candidates]
         if not abbrev:
-            emit_func(f"[green]Found match. {len(candidates)} upload candidate(s) at edition/media/encoding level.[/green]", indent=3)
+            emit_func(f"[yellow]Found match. {len(candidates)} upload candidate(s) at edition/media/encoding level.[/yellow]", indent=3)
         return target_group.group_id, urls_with_priority
     
     if not abbrev:
-        emit_func(f"[green]Found match. No upload candidates (all editions/torrents match).[/green]", indent=3)
+        emit_func(f"[cyan]Found match. No upload candidates (all editions/torrents match).[/cyan]", indent=3)
     return target_group.group_id, []

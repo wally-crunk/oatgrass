@@ -61,7 +61,7 @@ def _progress_timing_text(state: _ProgressState) -> tuple[str, str | None, str |
     if eta is None:
         return elapsed_text, None, None
     eta_text = _format_duration(eta)
-    finish_text = (datetime.now().astimezone() + timedelta(seconds=eta)).strftime("%H:%M:%S")
+    finish_text = (datetime.now().astimezone() + timedelta(seconds=eta)).strftime("%H:%M")
     return elapsed_text, eta_text, finish_text
 
 
@@ -69,7 +69,7 @@ def _timing_phrase(state: _ProgressState) -> str:
     elapsed_text, eta_text, finish_text = _progress_timing_text(state)
     if eta_text is None:
         return f"{elapsed_text} elapsed, ETA unknown"
-    return f"{elapsed_text} elapsed, ETA {eta_text} ({finish_text})"
+    return f"{elapsed_text} elapsed,  {eta_text} remaining, (ETA {finish_text})"
 
 
 async def _progress_heartbeat(state: _ProgressState) -> None:

@@ -365,7 +365,7 @@ async def run_search_mode(
                         )
                     else:
                         _emit(
-                            f"[Target, {opposite_tracker.name.upper()}] [magenta]Max size mismatch.[/magenta]",
+                            f"[Target, {opposite_tracker.name.upper()}] [yellow]Max size mismatch.[/yellow]",
                             indent=3,
                         )
 

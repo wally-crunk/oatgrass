@@ -60,7 +60,7 @@ def render_profile_summaries(console: Console, tracker_name: str, summaries: Ite
     table = Table(title=f"Profile List Summary ({tracker_name})")
     table.add_column("List", style="cyan", no_wrap=True)
     table.add_column("Count", style="green", justify="right")
-    table.add_column("Total Size (bytes)", style="magenta", justify="right")
+    table.add_column("Total Size (bytes)", style="cyan", justify="right")
     table.add_column("First Three Entries", style="yellow")
     for summary in summaries:
         first_three = " | ".join(summary.first_three)

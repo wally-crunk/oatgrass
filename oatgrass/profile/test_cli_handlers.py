@@ -103,6 +103,15 @@ def test_prompt_source_tracker_choice_rejects_unknown_tracker(monkeypatch: pytes
         cli._prompt_source_tracker_choice(_config(), cached_tracker=None)
 
 
+def test_prompt_source_tracker_choice_supports_load_from_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _load_cli_module(monkeypatch)
+    monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: "L")
+
+    selected = cli._prompt_source_tracker_choice(_config(), cached_tracker=None, allow_load_from_disk=True)
+    assert selected == "disk"
+
+
 def test_ensure_cache_for_followup_action_decline_refetch(monkeypatch: pytest.MonkeyPatch) -> None:
     cli = _load_cli_module(monkeypatch)
     cache = ProfileSessionState()
@@ -121,7 +130,6 @@ def test_ensure_cache_for_followup_action_decline_refetch(monkeypatch: pytest.Mo
         _config(),
         cache=cache,
         list_types=["snatched"],
-        option_choice="M",
         tracker_key="ops",
     )
     assert ok is False
@@ -145,7 +153,6 @@ def test_ensure_cache_for_followup_action_refetches_and_sets_cache(
         _config(),
         cache=cache,
         list_types=["snatched"],
-        option_choice="M",
         tracker_key="ops",
     )
     assert ok is True
@@ -169,7 +176,6 @@ def test_ensure_cache_for_followup_action_false_when_requested_list_stays_empty(
         _config(),
         cache=cache,
         list_types=["snatched"],
-        option_choice="M",
         tracker_key="ops",
     )
     assert ok is False
@@ -195,14 +201,13 @@ def test_ensure_cache_for_followup_action_uses_cached_without_fetch(
         _config(),
         cache=cache,
         list_types=["snatched"],
-        option_choice="M",
         tracker_key="ops",
     )
     assert ok is True
     assert called["summary"] is False
 
 
-def test_ensure_cache_for_followup_action_loads_from_disk(
+def test_load_profile_lists_into_cache_from_disk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cli = _load_cli_module(monkeypatch)
@@ -211,22 +216,23 @@ def test_ensure_cache_for_followup_action_loads_from_disk(
     monkeypatch.setattr(
         cli.Prompt,
         "ask",
-        lambda label, **_kwargs: "/tmp/fake.profile-lists.json" if label == "Profile list JSON path" else "L",
+        lambda label, **_kwargs: "/tmp/fake.profile-lists.json" if label == "Profile list JSON path" else "ignored",
     )
     monkeypatch.setattr(
         cli,
         "_load_profile_lists_from_disk",
-        lambda *_args, **_kwargs: {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []},
+        lambda *_args, **kwargs: (
+            {"snatched": [_entry()], "uploaded": [], "seeding": [], "leeching": []}
+            if kwargs.get("tracker_name") == "OPS"
+            else (_ for _ in ()).throw(ValueError("Snapshot tracker must match 'RED'"))
+        ),
     )
 
-    ok = cli._ensure_cache_for_followup_action(
-        _config(),
-        cache=cache,
-        list_types=["snatched"],
-        option_choice="M",
-        tracker_key="ops",
-    )
-    assert ok is True
+    loaded = cli._load_profile_lists_into_cache_from_disk(_config(), cache)
+    assert loaded is not None
+    tracker_key, tracker = loaded
+    assert tracker_key == "ops"
+    assert tracker.name == "OPS"
     assert cache.has_list("ops", "snatched")
 
 
@@ -241,10 +247,41 @@ def test_ensure_cache_for_followup_action_invalid_source_choice(
         _config(),
         cache=cache,
         list_types=["snatched"],
-        option_choice="M",
         tracker_key="ops",
     )
     assert ok is False
+
+
+def test_select_profile_list_action_loads_from_disk_and_filters_empty_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _load_cli_module(monkeypatch)
+    cache = ProfileSessionState()
+    prompts = iter(["L", "/tmp/fake.profile-lists.json", "1"])
+
+    monkeypatch.setattr(cli.console, "print", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *_args, **_kwargs: next(prompts))
+    monkeypatch.setattr(
+        cli,
+        "_load_profile_lists_from_disk",
+        lambda *_args, **kwargs: (
+            {
+                "snatched": [_entry(list_type="snatched")],
+                "uploaded": [],
+                "seeding": [],
+                "leeching": [],
+            }
+            if kwargs.get("tracker_name") == "OPS"
+            else (_ for _ in ()).throw(ValueError("Snapshot tracker must match 'RED'"))
+        ),
+    )
+
+    selected = cli._select_profile_list_action(_config(), cache)
+    assert selected is not None
+    tracker_key, tracker, lists = selected
+    assert tracker_key == "ops"
+    assert tracker.name == "OPS"
+    assert lists == ["snatched"]
 
 
 @pytest.mark.parametrize("menu_choice", ["M", "2"])

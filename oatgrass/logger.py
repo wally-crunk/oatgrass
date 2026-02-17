@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+from rich.console import Console
+from rich.text import Text
 
 class OatgrassLogger:
     """Minimal logger: print to screen + file, always flush"""
@@ -13,6 +15,7 @@ class OatgrassLogger:
     def __init__(self, log_file: Optional[Path] = None, debug: bool = False):
         self.log_file = log_file
         self._file_handle = None
+        self._console = Console()
         self._start_time = datetime.now()
         self.debug_mode = debug
         self._rate_limit_note_trackers: set[str] = set()
@@ -55,6 +58,22 @@ class OatgrassLogger:
     def clear_status(self) -> None:
         """Clear in-place status line, if any."""
         self._clear_status_line()
+
+    def _screen_text(self, output: str) -> Text:
+        text = Text(output)
+        for prefix, style, end in (("[INFO] ", "cyan", 6), ("[WARNING] ", "yellow", 9), ("[ERROR] ", "red", 7)):
+            if output.startswith(prefix):
+                text.stylize(style, 0, end)
+                return text
+        if output.startswith("   Candidate found: "):
+            text.stylize("yellow")
+        elif output.startswith("   Match found on target. Not a candidate."):
+            text.stylize("red")
+        elif output.startswith("   ") and " group #" in output and " torrent #" in output and "'" in output:
+            if (quote_start := output.find("'")) > 0 and (quote_end := output.rfind("'")) > quote_start:
+                text.stylize("grey50", 0, quote_start)
+                text.stylize("yellow", quote_start, quote_end + 1)
+        return text
     
     def log(self, msg: str, prefix: str = ""):
         """Log to screen and file"""
@@ -62,8 +81,7 @@ class OatgrassLogger:
         self._clear_status_line()
         
         # Screen (unbuffered)
-        print(output, flush=True)
-        sys.stdout.flush()  # Force flush
+        self._console.print(self._screen_text(output))
         
         # File
         if self._file_handle:

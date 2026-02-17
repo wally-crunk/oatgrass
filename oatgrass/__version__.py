@@ -1,3 +1,3 @@
 """Oatgrass version information."""
 
-__version__ = "0.2.0-beta3"
+__version__ = "0.2.0-beta4"

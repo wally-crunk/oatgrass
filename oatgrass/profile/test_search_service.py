@@ -115,7 +115,7 @@ def test_progress_timing_text_eta_known_with_24h_finish_clock(monkeypatch: pytes
 
     assert elapsed_text == "1m40s"
     assert eta_text == "1m40s"
-    assert finish_text == "21:30:14"
+    assert finish_text == "21:30"
 
 
 def test_render_progress_line_uses_unobtrusive_working_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +134,8 @@ def test_render_progress_line_uses_unobtrusive_working_prefix(monkeypatch: pytes
     monkeypatch.setattr(search_service, "datetime", _FixedDateTime)
     line = _render_progress_line(state)
     assert line.startswith("   Working: ")
-    assert "elapsed, ETA " in line
+    assert "elapsed,  " in line
+    assert " remaining, (ETA " in line
     assert line.endswith(")")
 
 

@@ -261,17 +261,32 @@ ProfileListSelection = ListType | Literal["all"]
 def _select_profile_list_action(
     config: OatgrassConfig,
     cache: ProfileSessionState,
-    option_choice: str,
 ) -> tuple[str, TrackerConfig, list[ListType]] | None:
-    tracker_key = _prompt_source_tracker_choice(config, cache.tracker_key)
-    tracker_key, tracker = resolve_profile_tracker(config, tracker_key)
+    tracker_choice = _prompt_source_tracker_choice(config, cache.tracker_key, allow_load_from_disk=True)
+    selected = (
+        _load_profile_lists_into_cache_from_disk(config, cache)
+        if tracker_choice == "disk"
+        else resolve_profile_tracker(config, tracker_choice)
+    )
+    if selected is None:
+        _ui_prompt("Press Enter to continue", default="")
+        return None
+    tracker_key, tracker = selected
+
     available_list_types = cast(list[ListType], list(resolve_tracker_profile(tracker.name).list_types))
+    if tracker_choice == "disk":
+        available_list_types = [list_type for list_type in available_list_types if cache.has_list(tracker_key, list_type)]
+        if not available_list_types:
+            _ui_warn("No non-empty lists were found in the loaded snapshot.")
+            _ui_prompt("Press Enter to continue", default="")
+            return None
+
     list_choice = _prompt_profile_list_choice(available_list_types)
     if list_choice is None:
         _ui_prompt("Press Enter to continue", default="")
         return None
     selected_lists = available_list_types if list_choice == "all" else [list_choice]
-    if not _ensure_cache_for_followup_action(config, cache, selected_lists, option_choice, tracker_key):
+    if tracker_choice != "disk" and not _ensure_cache_for_followup_action(config, cache, selected_lists, tracker_key):
         _ui_prompt("Press Enter to continue", default="")
         return None
     return tracker_key, tracker, selected_lists
@@ -290,7 +305,7 @@ def _handle_profile_summary_action(config: OatgrassConfig, cache: ProfileSession
 
 
 def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionState) -> None:
-    selected = _select_profile_list_action(config, cache, "2")
+    selected = _select_profile_list_action(config, cache)
     if selected is None:
         return
 
@@ -423,11 +438,8 @@ def _ensure_cache_for_followup_action(
     config: OatgrassConfig,
     cache: ProfileSessionState,
     list_types: list[ListType],
-    option_choice: str,
     tracker_key: str,
 ) -> bool:
-    _, tracker = resolve_profile_tracker(config, tracker_key)
-
     default_source = "C" if any(cache.has_list(tracker_key, list_type) for list_type in list_types) else "F"
     source = _prompt_profile_source_choice(default_source)
     if source is None:
@@ -436,29 +448,13 @@ def _ensure_cache_for_followup_action(
         if not any(cache.has_list(tracker_key, list_type) for list_type in list_types):
             joined = ", ".join(list_types)
             _ui_warn(
-                f"No cached rows found for selected list(s) [{joined}] on {tracker.name.upper()} for option {option_choice}."
+                f"No cached rows found for selected list(s) [{joined}] on {tracker_key.upper()} for option 2/M."
             )
             return False
         return True
     if source == "fetch":
         tracker_key, lists = asyncio.run(_run_profile_summary_menu(config, tracker_key=tracker_key))
         cache.set_snapshot(tracker_key, lists)
-    else:  # source == "disk"
-        path_raw = _ui_prompt("Profile list JSON path").strip()
-        if not path_raw:
-            _ui_warn("Path is required.")
-            return False
-        try:
-            loaded = _load_profile_lists_from_disk(
-                Path(path_raw).expanduser(),
-                tracker_name=tracker.name.upper(),
-                allowed_list_types=resolve_tracker_profile(tracker.name).list_types,
-            )
-        except ValueError as exc:
-            _ui_warn(f"Invalid profile list format: {exc}")
-            return False
-        cache.set_snapshot(tracker_key, loaded)
-        _ui_info("Profile lists loaded from disk.")
 
     available = [list_type for list_type in list_types if cache.has_list(tracker_key, list_type)]
     if not available:
@@ -475,15 +471,39 @@ def _prompt_profile_source_choice(default: str) -> str | None:
     console.print("\nProfile source:")
     console.print("  [F] Fetch now")
     console.print("  [C] Use cached")
-    console.print("  [L] Load from disk")
     choice = _ui_prompt("Source", default=default).strip().lower()
-    if choice in {"f", "fetch"}:
-        return "fetch"
-    if choice in {"c", "cached", "cache"}:
-        return "cached"
-    if choice in {"l", "load", "disk"}:
-        return "disk"
-    _ui_warn("Invalid profile source choice.")
+    if choice not in {"f", "fetch", "c", "cached", "cache"}:
+        _ui_warn("Invalid profile source choice.")
+        return None
+    return "fetch" if choice in {"f", "fetch"} else "cached"
+
+
+def _load_profile_lists_into_cache_from_disk(
+    config: OatgrassConfig,
+    cache: ProfileSessionState,
+) -> tuple[str, TrackerConfig] | None:
+    path_raw = _ui_prompt("Profile list JSON path").strip()
+    if not path_raw:
+        _ui_warn("Path is required.")
+        return None
+
+    snapshot_path = Path(path_raw).expanduser()
+    for tracker_key, tracker in configured_profile_trackers(config):
+        try:
+            loaded = _load_profile_lists_from_disk(
+                snapshot_path,
+                tracker_name=tracker.name.upper(),
+                allowed_list_types=resolve_tracker_profile(tracker.name).list_types,
+            )
+        except ValueError as exc:
+            if str(exc).startswith("Snapshot tracker must match"):
+                continue
+            _ui_warn(f"Invalid profile list format: {exc}")
+            return None
+        cache.set_snapshot(tracker_key, loaded)
+        _ui_info(f"Profile lists loaded from disk for {tracker.name.upper()}.")
+        return tracker_key, tracker
+    _ui_warn("Invalid profile list format: Snapshot tracker is not configured with an API key.")
     return None
 
 
@@ -539,23 +559,31 @@ def _load_profile_lists_from_disk(
     return parsed
 
 
-def _prompt_source_tracker_choice(config: OatgrassConfig, cached_tracker: str | None) -> str:
+def _prompt_source_tracker_choice(
+    config: OatgrassConfig,
+    cached_tracker: str | None,
+    *,
+    allow_load_from_disk: bool = False,
+) -> str:
     trackers = configured_profile_trackers(config)
     if not trackers:
         raise ValueError("No configured tracker with API key found.")
     default_choice = trackers[0][0].upper()
     if cached_tracker:
-        for key, _tracker in trackers:
-            if key.lower() == cached_tracker.lower():
-                default_choice = key.upper()
-                break
+        default_choice = next(
+            (key.upper() for key, _ in trackers if key.lower() == cached_tracker.lower()),
+            default_choice,
+        )
 
     console.print("\nSource tracker:")
     for key, tracker in trackers:
         console.print(f"  [{key.upper()}] {tracker.name.upper()} ({tracker.url})")
+    if allow_load_from_disk:
+        console.print("  [L] Load from file")
     selected = _ui_prompt("Source tracker", default=default_choice).strip()
-    selected_key, _ = resolve_profile_tracker(config, selected)
-    return selected_key
+    if allow_load_from_disk and selected.lower() in {"l", "load"}:
+        return "disk"
+    return resolve_profile_tracker(config, selected)[0]
 
 
 def _run_search_mode_prompt(config: OatgrassConfig) -> None:
