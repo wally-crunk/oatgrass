@@ -14,9 +14,15 @@ from oatgrass.config import OatgrassConfig, TrackerConfig
 from oatgrass.profile.retriever import ListType, ProfileTorrent
 from oatgrass.profile.tracker_selection import resolve_profile_tracker
 from oatgrass.search.gazelle_client import GazelleServiceAdapter
-from oatgrass.search.search_mode import _next_run_path, _pick_opposite_tracker
+from oatgrass.search.resilience import (
+    optional_list_of_dicts,
+    response_payload,
+    run_with_retries,
+)
+from oatgrass.search.group_search import _next_run_path, _pick_opposite_tracker
 
 PROFILE_SEARCH_PROGRESS_HEARTBEAT_SECONDS = 5.0
+PROFILE_ENTRY_MAX_ATTEMPTS = 3
 
 @dataclass(frozen=True)
 class ProfileSearchResult:
@@ -147,7 +153,8 @@ async def _find_source_browse_result(
     group_id: int,
 ) -> dict | None:
     browse = await source_client.search(artistname=artist, groupname=album, year=year)
-    results = browse.get("response", {}).get("results", [])
+    response = response_payload(browse, "Source browse search")
+    results = optional_list_of_dicts(response, "results", "Source browse search")
     for result in results:
         try:
             if int(result.get("groupId") or 0) == group_id:
@@ -174,9 +181,13 @@ async def _evaluate_profile_entry(
         if entry.torrent_id is None:
             return _skip_entry("Skipping cached row with missing group/torrent IDs")
         torrent_response = await source_client.get_torrent(entry.torrent_id)
-        torrent_block = torrent_response.get("response", {})
+        torrent_block = response_payload(torrent_response, "Source torrent")
         group_data = torrent_block.get("group", {})
         source_torrent = torrent_block.get("torrent", {})
+        if not isinstance(group_data, dict):
+            group_data = {}
+        if not isinstance(source_torrent, dict):
+            source_torrent = {}
         if not source_torrent:
             return _skip_entry(f"Skipping torrent {entry.torrent_id}: no torrent payload available")
         inferred_group_id = int(group_data.get("id") or 0)
@@ -185,24 +196,38 @@ async def _evaluate_profile_entry(
         entry = _enrich_profile_entry(entry, inferred_group_id, source_torrent)
     else:
         source_group_response = await source_client.get_group(entry.group_id)
-        response = source_group_response.get("response", {})
-        group_data = response.get("group", {})
-        torrents = response.get("torrents", [])
+        group_response = response_payload(source_group_response, "Source group")
+        group_data = group_response.get("group", {})
+        if not isinstance(group_data, dict):
+            group_data = {}
+        torrents = group_response.get("torrents", [])
+        if not isinstance(torrents, list):
+            torrents = []
         source_torrent = _find_torrent_in_group(torrents, entry.torrent_id) if entry.torrent_id is not None else None
         if not source_torrent and entry.torrent_id is not None:
             torrent_response = await source_client.get_torrent(entry.torrent_id)
-            torrent_block = torrent_response.get("response", {})
+            torrent_block = response_payload(torrent_response, "Source torrent")
             source_torrent = torrent_block.get("torrent", {})
+            if not isinstance(source_torrent, dict):
+                source_torrent = {}
             if source_torrent:
-                group_data = torrent_block.get("group", group_data)
+                fallback_group_data = torrent_block.get("group", group_data)
+                if isinstance(fallback_group_data, dict):
+                    group_data = fallback_group_data
         if not source_torrent:
             return _skip_entry(
                 f"Skipping group {entry.group_id}: source torrent {entry.torrent_id} not found in group/torrent responses"
             )
         entry = _enrich_profile_entry(entry, entry.group_id, source_torrent)
 
-    artists = group_data.get("musicInfo", {}).get("artists", []) or []
-    group_artist = artists[0].get("name", "") if artists else ""
+    music_info = group_data.get("musicInfo", {})
+    if not isinstance(music_info, dict):
+        music_info = {}
+    artists = music_info.get("artists", []) or []
+    if not isinstance(artists, list):
+        artists = []
+    first_artist = artists[0] if artists and isinstance(artists[0], dict) else {}
+    group_artist = first_artist.get("name", "")
     group_name = group_data.get("name") or entry.group_name or ""
     group_year = group_data.get("year")
     search_artist = group_artist or (entry.artist_name or group_name)
@@ -233,8 +258,13 @@ async def _evaluate_profile_entry(
     if opposite_tracker.name.lower() == "red":
         target_gid = int(target_result.get("groupId"))
         target_group_response = await target_client.get_group(target_gid)
-        target_group_data = target_group_response.get("response", {}).get("group", {})
-        target_torrents = target_group_response.get("response", {}).get("torrents", [])
+        target_response = response_payload(target_group_response, "Target group")
+        target_group_data = target_response.get("group", {})
+        if not isinstance(target_group_data, dict):
+            target_group_data = {}
+        target_torrents = target_response.get("torrents", [])
+        if not isinstance(target_torrents, list):
+            target_torrents = []
         target_group = parse_group_hybrid(
             target_group_data,
             target_torrents,
@@ -263,7 +293,7 @@ async def _evaluate_profile_entry(
     return _to_candidate_urls(source_tracker, candidates), False
 
 
-async def run_profile_list_search(
+async def run_profile_search_workflow(
     config: OatgrassConfig,
     source_tracker_key: str,
     list_type: ListType,
@@ -303,16 +333,25 @@ async def run_profile_list_search(
             entry_candidates: list[tuple[str, int]] = []
             was_skipped = False
             try:
-                entry_candidates, was_skipped = await _evaluate_profile_entry(
-                    entry,
-                    source_tracker,
-                    opposite_tracker,
-                    source_client,
-                    target_client,
-                    group_only=group_only,
+                entry_candidates, was_skipped = await run_with_retries(
+                    lambda: _evaluate_profile_entry(
+                        entry,
+                        source_tracker,
+                        opposite_tracker,
+                        source_client,
+                        target_client,
+                        group_only=group_only,
+                    ),
+                    max_attempts=PROFILE_ENTRY_MAX_ATTEMPTS,
+                    on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
+                        f"Transient profile entry failure ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}); "
+                        f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
+                    ),
                 )
             except Exception as exc:  # pragma: no cover - guard for network/API errors
-                logger.warning(f"Entry failed: {exc}")
+                logger.warning(
+                    f"Entry failed after retries ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}): {exc}"
+                )
                 was_skipped = True
 
             if was_skipped:

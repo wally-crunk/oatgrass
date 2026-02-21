@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oatgrass"
-version = "0.2.0d1"
+version = "0.2.1"
 description = "Oatgrass - feed the gazelles"
 readme = "docs/README.md"
 requires-python = ">=3.10"
