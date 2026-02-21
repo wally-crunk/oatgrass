@@ -26,10 +26,10 @@ try:
         ProfileTorrent,
         format_list_label,
     )
-    from .profile.search_service import run_profile_list_search
+    from .profile.profile_search import run_profile_search_workflow
     from .profile.session_state import ProfileSessionState
     from .profile.tracker_selection import configured_profile_trackers, resolve_profile_tracker
-    from .search.search_mode import run_search_mode, _next_run_path
+    from .search.group_search import run_group_search_workflow, _next_run_path
     from .tracker_profile import resolve_tracker_profile
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
@@ -41,7 +41,7 @@ PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW = 3
 PROFILE_SEARCH_BEST_CASE_API_DELAY_SECONDS = GAZELLE_MIN_INTERVAL_SECONDS
 _CLI_SESSION_START_MONOTONIC = time.monotonic()
 _SCIPY_AVAILABLE: bool | None = None
-_SCIPY_HINT_EMITTED = False
+_SCIPY_STARTUP_WARNING_EMITTED = False
 MAIN_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "Search for Cross-Upload Candidates",
@@ -86,6 +86,12 @@ def _ui_prompt(label: str, default: str | None = None) -> str:
     if default is None:
         return Prompt.ask(label)
     return Prompt.ask(label, default=default)
+
+
+def _strip_surrounding_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
 
 
 def _ui_prompt_yesno(
@@ -142,17 +148,13 @@ def _has_scipy() -> bool:
     return _SCIPY_AVAILABLE
 
 
-def _warn_missing_scipy(message: str) -> None:
-    _ui_warn(message)
-    _warn_missing_scipy_hint()
-
-
-def _warn_missing_scipy_hint() -> None:
-    global _SCIPY_HINT_EMITTED
-    if _SCIPY_HINT_EMITTED:
+def _emit_scipy_startup_warning_once() -> None:
+    global _SCIPY_STARTUP_WARNING_EMITTED
+    if _SCIPY_STARTUP_WARNING_EMITTED or _has_scipy():
         return
-    _ui_warn("1. Try `source venv/bin/activate` before launching.")
-    _SCIPY_HINT_EMITTED = True
+    _ui_warn("scipy not found: edition comparisons are disabled.")
+    _ui_warn("Try `source venv/bin/activate` before launching oatgrass.")
+    _SCIPY_STARTUP_WARNING_EMITTED = True
 
 
 def redact_api_key(key: str) -> str:
@@ -167,11 +169,6 @@ def redact_api_key(key: str) -> str:
 def display_config_table(config: OatgrassConfig):
     """Display current API key configuration status"""
     _ui_info(f'Config loaded: "{config.config_path}"')
-    if not _has_scipy():
-        _ui_warn(
-            "scipy not found: edition-aware matching is unavailable. "
-            "Try `source venv/bin/activate` before launching."
-        )
 
     table = Table(title="API configuration")
     table.add_column("Service", style="cyan")
@@ -233,7 +230,7 @@ def _handle_main_menu_choice(config: OatgrassConfig, cache: ProfileSessionState,
         "1": lambda: _handle_profile_summary_action(config, cache),
         "2": lambda: _handle_profile_search_action(config, cache),
         "V": lambda: asyncio.run(verify_api_keys(config)),
-        "S": lambda: _run_search_mode_prompt(config),
+        "S": lambda: _run_group_search_prompt(config),
     }
     handler = handlers.get(choice)
     if handler is None:
@@ -307,14 +304,6 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
     tracker_key, _tracker, list_types = selected
     group_only_mode = False
     if not _has_scipy():
-        _warn_missing_scipy("scipy not found: edition-aware matching is unavailable for option 2/M.")
-        if not _ui_prompt_yesno(
-            "2. Proceed without edition-aware matching (group-only mode)?",
-            default_yes=False,
-            allow_cancel=True,
-        ):
-            _ui_prompt("Press Enter to continue", default="")
-            return
         group_only_mode = True
 
     selected_with_rows = [list_type for list_type in list_types if cache.has_list(tracker_key, list_type)]
@@ -338,7 +327,7 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
         entries = cache.get_list(tracker_key, list_type)
         _ui_info(f"Running profile search for '{list_type}' ({len(entries)} row(s))")
         result = asyncio.run(
-            run_profile_list_search(
+            run_profile_search_workflow(
                 config=config,
                 source_tracker_key=tracker_key,
                 list_type=list_type,
@@ -587,7 +576,7 @@ def _prompt_source_tracker_choice(
     return resolve_profile_tracker(config, selected)[0]
 
 
-def _run_search_mode_prompt(config: OatgrassConfig) -> None:
+def _run_group_search_prompt(config: OatgrassConfig) -> None:
     def _prompt_menu_choice(
         title: str,
         prompt_label: str,
@@ -600,7 +589,7 @@ def _run_search_mode_prompt(config: OatgrassConfig) -> None:
             console.print(f"  [{key}] {label}")
         return _ui_prompt(prompt_label, default=default).strip().upper()
 
-    search_mode_target = _ui_prompt("Collage or group URL/ID").strip()
+    search_mode_target = _strip_surrounding_quotes(_ui_prompt("Collage or group URL/ID").strip())
 
     tracker_key = None
     if not (search_mode_target.startswith("http://") or search_mode_target.startswith("https://")):
@@ -639,7 +628,6 @@ def _run_search_mode_prompt(config: OatgrassConfig) -> None:
         )
         basic = matching_choice == "G"
     else:
-        _warn_missing_scipy("scipy not found: matching mode is fixed to Group-only for this run.")
         basic = True
 
     fallback_choice = _prompt_menu_choice(
@@ -655,7 +643,7 @@ def _run_search_mode_prompt(config: OatgrassConfig) -> None:
     no_fallback = fallback_choice == "X"
     no_discogs = fallback_choice == "D" or (fallback_choice == "F" and not config.api_keys.discogs_key)
 
-    asyncio.run(run_search_mode(
+    asyncio.run(run_group_search_workflow(
         config,
         search_mode_target,
         tracker_key=tracker_key,
@@ -686,7 +674,7 @@ def _show_profile_search_estimate(
 ) -> None:
     per_row_calls = PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW
     try:
-        from .profile.search_service import _pick_opposite_tracker
+        from .profile.profile_search import _pick_opposite_tracker
 
         source_key, _ = resolve_profile_tracker(config, source_tracker_key)
         _, target_tracker = _pick_opposite_tracker(config.trackers, source_key)
@@ -782,6 +770,7 @@ def main():
 
         config_path = resolve_config_path(args.config)
         config = load_config(config_path)
+        _emit_scipy_startup_warning_once()
         
         if args.url_or_id:
             # Check for conflicting flags
@@ -795,11 +784,10 @@ def main():
             output_dir = Path(args.output).expanduser() if args.output else Path("output")
             basic_mode = args.search_groups
             if not basic_mode and not _has_scipy():
-                _warn_missing_scipy("scipy not found: falling back to --search-groups for this run.")
                 basic_mode = True
             
             asyncio.run(
-                run_search_mode(
+                run_group_search_workflow(
                     config,
                     args.url_or_id,
                     strict=args.no_fallback,

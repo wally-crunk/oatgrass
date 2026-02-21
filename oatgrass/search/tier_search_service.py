@@ -6,6 +6,7 @@ from typing import Optional
 from difflib import SequenceMatcher
 
 from oatgrass.search.gazelle_client import GazelleServiceAdapter
+from oatgrass.search.resilience import optional_list_of_dicts, response_payload
 
 STOPWORDS = {"the", "a", "an"}
 VERSION_INDICATORS = {"deluxe", "demo", "demos", "remaster", "remastered", "expanded", "edition", "anniversary", "special", "bonus", "live", "outtakes"}
@@ -125,7 +126,8 @@ async def search_with_tiers(
             release_type=release_type_param,
             media=media_param,
         )
-        hits = results.get("response", {}).get("results", [])
+        response = response_payload(results, "Browse search")
+        hits = optional_list_of_dicts(response, "results", "Browse search")
         if not hits:
             return None
         return _select_best_result(hits, artist, album, year)
