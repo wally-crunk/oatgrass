@@ -27,7 +27,7 @@ async def process_entry_edition_aware(
     Returns:
         (target_group_id, list_of_(url, priority)_tuples)
     """
-    from oatgrass.search.search_mode import _build_search_context, _group_id, _cross_upload_url
+    from oatgrass.search.group_search import _build_search_context, _group_id, _cross_upload_url
     
     search_context = _build_search_context(entry)
     source_gid = _group_id(entry)
