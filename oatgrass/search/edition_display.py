@@ -1,10 +1,17 @@
 """Format edition data for display (Stage 3)."""
 
-from typing import List, Optional, TextIO
+from typing import Callable, List, Optional, TextIO
 
 from oatgrass.search.types import EditionInfo, GroupInfo
 from oatgrass.search.edition_matcher import EditionMatch
 from oatgrass import logger
+
+
+EmitFunc = Callable[..., None]
+
+
+def _resolve_emit(emit_func: Optional[EmitFunc]) -> EmitFunc:
+    return emit_func or logger.log
 
 
 def display_editions(
@@ -13,40 +20,49 @@ def display_editions(
     source_name: str,
     target_name: str,
     output: Optional[TextIO] = None,
+    emit_func: Optional[EmitFunc] = None,
+    base_indent: int = 0,
 ) -> None:
     """Display source and target editions side-by-side (Stage 3)."""
-    logger.log(f"Source ({source_name}):")
+    emit = _resolve_emit(emit_func)
+    emit(f"Source ({source_name}):", indent=base_indent)
     for idx, edition in enumerate(source.editions, 1):
-        logger.log(f"    Edition {idx}:")
-        logger.log(f"        Edition tuple: {_format_edition_tuple(edition)}")
-    
+        emit(f"Edition {idx}:", indent=base_indent + 4)
+        emit(f"Edition tuple: {_format_edition_tuple(edition)}", indent=base_indent + 8)
+
     if target:
-        logger.log(f"Target ({target_name}):")
+        emit(f"Target ({target_name}):", indent=base_indent)
         for idx, edition in enumerate(target.editions, 1):
-            logger.log(f"    Edition {idx}:")
-            logger.log(f"        Edition tuple: {_format_edition_tuple(edition)}")
+            emit(f"Edition {idx}:", indent=base_indent + 4)
+            emit(f"Edition tuple: {_format_edition_tuple(edition)}", indent=base_indent + 8)
     else:
-        logger.log(f"Target ({target_name}): No match found")
+        emit(f"Target ({target_name}): No match found", indent=base_indent)
 
 
 def display_edition_matches(
     matches: List[EditionMatch],
     min_confidence: int,
     output: Optional[TextIO] = None,
+    emit_func: Optional[EmitFunc] = None,
+    base_indent: int = 0,
 ) -> None:
     """Display edition matching results (Stage 4)."""
-    logger.log(f"Minimum confidence required: {min_confidence}%")
-    
+    emit = _resolve_emit(emit_func)
+    emit(f"Minimum confidence required: {min_confidence}%", indent=base_indent)
+
     matched_count = sum(1 for m in matches if m.target_edition is not None)
-    
+
     for idx, match in enumerate(matches, 1):
         if match.target_edition:
-            logger.log(f"Source Edition {idx}: matches target")
-            logger.log(f"    Confidence {match.confidence}% ({_format_contributions(match.contributions)})")
+            emit(f"Source Edition {idx}: matches target", indent=base_indent)
+            emit(
+                f"Confidence {match.confidence}% ({_format_contributions(match.contributions)})",
+                indent=base_indent + 4,
+            )
         else:
-            logger.log(f"Source Edition {idx}: no match in target")
-    
-    logger.log(f"Matched ({matched_count}/{len(matches)}) Editions")
+            emit(f"Source Edition {idx}: no match in target", indent=base_indent)
+
+    emit(f"Matched ({matched_count}/{len(matches)}) Editions", indent=base_indent)
 
 
 def _format_edition_tuple(edition: EditionInfo) -> str:

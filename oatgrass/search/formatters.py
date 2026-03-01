@@ -11,9 +11,21 @@ console = Console()
 
 def emit(message: str, indent: int = 0) -> None:
     """Emit message to screen and log file via logger."""
-    padding = " " * max(indent, 0)
     plain = Text.from_markup(message).plain
-    logger.log(f"{padding}{plain}")
+    logger.log(plain, indent=indent)
+
+
+def format_task_context_line(
+    source_tracker_name: str,
+    source_gid: int | str,
+    target_tracker_name: str,
+    target_gid: int | None,
+) -> str:
+    target_label = target_gid if target_gid is not None else "not found"
+    return (
+        f"Source: {source_tracker_name.upper()} album #{source_gid}, "
+        f"Target: {target_tracker_name.upper()} album #{target_label}"
+    )
 
 
 def format_size(size: int | None) -> str:

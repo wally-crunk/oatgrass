@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from pathlib import Path
 
 from oatgrass.config import OatgrassConfig, TrackerConfig
+from oatgrass.progress_timing import build_task_timing_phrase
 from oatgrass.search.formatters import (
     emit as _emit,
     display_value as _display_value,
     format_compact_result as _format_compact_result,
     format_size as _format_size,
+    format_task_context_line as _format_task_context_line,
 )
 from oatgrass.search.parsers import (
     SearchContext,
@@ -205,7 +208,7 @@ async def _load_entries_for_target(
             group_id = int(target)
         except ValueError as exc:
             raise ValueError("Group id must be numeric") from exc
-        source_key = tracker_key or "red"
+        source_key = tracker_key or max(config.trackers)
         source_tracker = _resolve_tracker_by_key(config.trackers, source_key)
         _, opposite_tracker = _pick_opposite_tracker(config.trackers, source_key)
         entries = await _fetch_group_entries_with_retries(source_tracker, group_id)
@@ -217,9 +220,14 @@ def _emit_final_candidates(
     entries: list[dict],
     cross_upload_candidates: list[tuple[str, int]],
 ) -> None:
+    if not cross_upload_candidates and not entries:
+        return
+
+    _emit("")
+    _emit("[End of Run]")
+
     if cross_upload_candidates:
-        _emit("\n[End of Run]")
-        _emit("  Explore the following for possible upload:")
+        _emit("Explore the following for possible upload:", indent=3)
 
         by_priority: dict[int, list[str]] = {}
         for url, priority in cross_upload_candidates:
@@ -233,12 +241,11 @@ def _emit_final_candidates(
                 20: "Priority 20 (new media)",
                 10: "Priority 10 (new encoding)",
             }.get(priority, f"Priority {priority}")
-            _emit(f"  {priority_label}:")
+            _emit(f"{priority_label}:", indent=3)
             for url in urls:
-                _emit(f"    {url}")
+                _emit(url, indent=6)
     elif entries:
-        _emit("\n[End of Run]")
-        _emit("  No cross-upload candidates found.")
+        _emit("No cross-upload candidates found.", indent=3)
 
 
 async def run_group_search_workflow(
@@ -322,14 +329,33 @@ async def run_group_search_workflow(
                 _emit(f"[yellow]Warning: Discogs initialization failed: {e}. Tier 5 search will be skipped.[/yellow]")
 
         cross_upload_candidates = []
+        show_task_context = (verbose or debug) and not abbrev
+        started_at = time.monotonic()
 
         for idx, entry in enumerate(entries, start=1):
             search_context = _build_search_context(entry)
             source_gid = _group_id(entry)
             source_group_label = source_gid if source_gid is not None else "?"
+            def _emit_task_context(target_gid: int | None) -> None:
+                if show_task_context:
+                    _emit(
+                        _format_task_context_line(
+                            source_tracker.name,
+                            source_group_label,
+                            opposite_tracker.name,
+                            target_gid,
+                        ),
+                        indent=3,
+                    )
 
             if not abbrev:
-                _emit(f"[Task {idx} of {total}]")
+                timing_phrase = build_task_timing_phrase(
+                    total=total,
+                    completed=idx - 1,
+                    started_at=started_at,
+                )
+                _emit("")
+                _emit(f"[Task {idx} of {total}] —— {timing_phrase}")
 
             hit = None
             used_tier = 1
@@ -399,7 +425,7 @@ async def run_group_search_workflow(
                         _target_gid, edition_candidates = await process_entry_edition_aware(
                             entry, source_tracker, opposite_tracker,
                             source_client, gazelle_client,
-                            _emit, abbrev, verbose
+                            _emit, abbrev, verbose, show_context_line=show_task_context
                         )
                         if edition_candidates:
                             cross_upload_candidates.extend(edition_candidates)
@@ -421,6 +447,7 @@ async def run_group_search_workflow(
                             )
                             _emit(compact)
                     else:
+                        _emit_task_context(None)
                         _emit(
                             "[yellow]No matching group found on the opposite tracker.[/yellow]",
                             indent=3,
@@ -445,6 +472,7 @@ async def run_group_search_workflow(
                         )
                         _emit(compact)
                     else:
+                        _emit_task_context(hit_group_id)
                         _emit(
                             f"[Target, {opposite_tracker.name.upper()}] Found group: {hit_title} (ID {hit_group_id})",
                             indent=3,

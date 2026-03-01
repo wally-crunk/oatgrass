@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List
 
 from oatgrass.search.edition_comparison import EditionComparison, EncodingComparison
+from oatgrass.search.encoding_order import encoding_candidate_rank
 from oatgrass.search.types import TorrentInfo
 from oatgrass import logger
 
@@ -20,35 +21,76 @@ class UploadCandidate:
     priority: int  # Higher = more important
 
 
+def _candidate_rank_key(candidate: UploadCandidate) -> tuple[int, int, int]:
+    """Sort key: best encoding first, then size, then stable torrent-id tie-break."""
+    return (
+        encoding_candidate_rank(candidate.encoding),
+        candidate.size,
+        -candidate.source_torrent.torrent_id,
+    )
+
+
+def _build_candidate(
+    edition,
+    media: str,
+    enc_comp: EncodingComparison,
+    priority: int,
+) -> UploadCandidate:
+    source_torrent = enc_comp.source_torrent
+    assert source_torrent is not None
+    return UploadCandidate(
+        source_torrent=source_torrent,
+        edition_year=edition.year or 0,
+        edition_title=edition.title or "(no title)",
+        media=media,
+        encoding=enc_comp.encoding,
+        size=source_torrent.size,
+        priority=priority,
+    )
+
+
 def find_upload_candidates(comparisons: List[EditionComparison]) -> List[UploadCandidate]:
     """Extract and prioritize upload candidates from edition comparisons."""
-    candidates = []
-    
+    candidates: List[UploadCandidate] = []
+
+    # Group-level media presence on target (from matched edition comparisons).
+    target_media_present = {
+        media_comp.media.lower()
+        for comp in comparisons
+        for media_comp in comp.media_comparisons
+        if any(enc.target_torrent is not None for enc in media_comp.encodings)
+    }
+
     for comp in comparisons:
         edition = comp.match.source_edition
-        
+
+        if comp.match.target_edition is None:
+            # Missing edition: keep normal 20/10 semantics, but promote one top-value
+            # candidate within each unmatched edition to Priority 50.
+            unmatched_candidates: List[UploadCandidate] = []
+            for media_comp in comp.media_comparisons:
+                media_exists_on_target = media_comp.media.lower() in target_media_present
+                for enc_comp in media_comp.encodings:
+                    if enc_comp.is_upload_candidate and enc_comp.source_torrent:
+                        priority = 10 if media_exists_on_target else 20
+                        unmatched_candidates.append(
+                            _build_candidate(edition, media_comp.media, enc_comp, priority)
+                        )
+
+            if unmatched_candidates:
+                best_candidate = max(unmatched_candidates, key=_candidate_rank_key)
+                best_candidate.priority = 50
+                candidates.extend(unmatched_candidates)
+            continue
+
         for media_comp in comp.media_comparisons:
-            # Check if this media exists on target at all
-            has_target_media = any(
-                enc.target_torrent is not None 
-                for enc in media_comp.encodings
-            )
-            
+            # Matched edition: Priority 20 if new media, 10 if encoding gap in existing media.
+            has_target_media = any(enc.target_torrent is not None for enc in media_comp.encodings)
             for enc_comp in media_comp.encodings:
                 if enc_comp.is_upload_candidate and enc_comp.source_torrent:
-                    # Priority 20 if new media, Priority 10 if new encoding within existing media
                     priority = 20 if not has_target_media else 10
-                    
-                    candidates.append(UploadCandidate(
-                        source_torrent=enc_comp.source_torrent,
-                        edition_year=edition.year or 0,
-                        edition_title=edition.title or "(no title)",
-                        media=media_comp.media,
-                        encoding=enc_comp.encoding,
-                        size=enc_comp.source_torrent.size,
-                        priority=priority
-                    ))
-    
+                    candidates.append(_build_candidate(edition, media_comp.media, enc_comp, priority))
+
     # Sort by priority (descending)
     candidates.sort(key=lambda c: c.priority, reverse=True)
     return candidates

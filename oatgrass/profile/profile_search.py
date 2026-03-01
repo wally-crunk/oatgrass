@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
 from oatgrass import logger
 from oatgrass.config import OatgrassConfig, TrackerConfig
+from oatgrass.progress_timing import build_task_timing_phrase
 from oatgrass.profile.retriever import ListType, ProfileTorrent
 from oatgrass.profile.tracker_selection import resolve_profile_tracker
 from oatgrass.search.gazelle_client import GazelleServiceAdapter
@@ -43,39 +43,13 @@ class _ProgressState:
     done: bool = False
 
 
-def _format_duration(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{secs:02d}s"
-    if minutes:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
-
-
 def _render_progress_line(state: _ProgressState) -> str:
-    return f"   Working: {_timing_phrase(state)}"
-
-
-def _progress_timing_text(state: _ProgressState) -> tuple[str, str | None, str | None]:
-    elapsed = time.monotonic() - state.started_at
-    rate = state.completed / elapsed if elapsed > 0 else 0.0
-    remaining = max(0, state.total - state.completed)
-    eta = remaining / rate if rate > 0 else None
-    elapsed_text = _format_duration(elapsed)
-    if eta is None:
-        return elapsed_text, None, None
-    eta_text = _format_duration(eta)
-    finish_text = (datetime.now().astimezone() + timedelta(seconds=eta)).strftime("%H:%M")
-    return elapsed_text, eta_text, finish_text
-
-
-def _timing_phrase(state: _ProgressState) -> str:
-    elapsed_text, eta_text, finish_text = _progress_timing_text(state)
-    if eta_text is None:
-        return f"{elapsed_text} elapsed, ETA unknown"
-    return f"{elapsed_text} elapsed,  {eta_text} remaining, (ETA {finish_text})"
+    phrase = build_task_timing_phrase(
+        total=state.total,
+        completed=state.completed,
+        started_at=state.started_at,
+    )
+    return f"   Working: {phrase}"
 
 
 async def _progress_heartbeat(state: _ProgressState) -> None:
@@ -325,7 +299,12 @@ async def run_profile_search_workflow(
             progress.current_index = idx
             group_id = entry.group_id if entry.group_id is not None else "?"
             torrent_id = entry.torrent_id if entry.torrent_id is not None else "?"
-            logger.info(f"[Task {idx}/{total}] {_timing_phrase(progress)}")
+            timing_phrase = build_task_timing_phrase(
+                total=total,
+                completed=idx - 1,
+                started_at=progress.started_at,
+            )
+            logger.info(f"[Task {idx} of {total}] —— {timing_phrase}")
             logger.info(
                 f"   {source_tracker.name.lower()} group #{group_id} "
                 f"torrent #{torrent_id} '{entry.group_name or ''}'"

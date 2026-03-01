@@ -1,11 +1,19 @@
 """Compare media/encoding between matched editions (Stage 5)."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
+from oatgrass.search.encoding_order import encoding_display_key
 from oatgrass.search.edition_matcher import EditionMatch
 from oatgrass.search.types import TorrentInfo
 from oatgrass import logger
+
+
+EmitFunc = Callable[..., None]
+
+
+def _resolve_emit(emit_func: Optional[EmitFunc]) -> EmitFunc:
+    return emit_func or logger.log
 
 
 def _sizes_match(size1: int, size2: int) -> bool:
@@ -226,50 +234,88 @@ def _is_lossless(encoding: str) -> bool:
     return any(x in enc_lower for x in ["flac", "lossless", "24bit"])
 
 
-def display_edition_comparisons(comparisons: List[EditionComparison], source_name: str, target_name: str):
+def display_edition_comparisons(
+    comparisons: List[EditionComparison],
+    source_name: str,
+    target_name: str,
+    emit_func: Optional[EmitFunc] = None,
+    base_indent: int = 0,
+    show_tracker_summary: bool = True,
+):
     """Display Stage 5 results."""
-    logger.log(f"Source: {source_name}")
-    logger.log(f"Target: {target_name}")
-    logger.log("")
+    emit = _resolve_emit(emit_func)
+
+    def _out(message: str, offset: int = 0) -> None:
+        emit(message, indent=base_indent + offset)
+
+    if show_tracker_summary:
+        _out(f"Source: {source_name}")
+        _out(f"Target: {target_name}")
+        _out("")
     
     for idx, comp in enumerate(comparisons, 1):
         match = comp.match
         source_ed = match.source_edition
         
-        logger.log(f"Source Edition {idx}: {source_ed.year} / {source_ed.title or '(no title)'} / {source_ed.label or '(no label)'} / {source_ed.catalog or '(no catalog)'}")
+        _out(
+            f"Source Edition {idx}: {source_ed.year} / {source_ed.title or '(no title)'} / "
+            f"{source_ed.label or '(no label)'} / {source_ed.catalog or '(no catalog)'}",
+        )
         
         if match.target_edition:
             target_ed = match.target_edition
-            logger.log(f"Target Edition: {target_ed.year} / {target_ed.title or '(no title)'} / {target_ed.label or '(no label)'} / {target_ed.catalog or '(no catalog)'}")
-            logger.log(f"  Confidence: {match.confidence}%")
+            _out(
+                f"Target Edition: {target_ed.year} / {target_ed.title or '(no title)'} / "
+                f"{target_ed.label or '(no label)'} / {target_ed.catalog or '(no catalog)'}",
+            )
+            _out(f"Confidence: {match.confidence}%", 2)
             
             # Show warning if media types don't overlap
             if getattr(match, 'has_media_mismatch_warning', False):
                 source_media = sorted(set(t.media for t in source_ed.torrents))
                 target_media = sorted(set(t.media for t in target_ed.torrents))
-                logger.log(f"  ⚠️  WARNING: High confidence match but NO overlapping media types!")
-                logger.log(f"      Source media: {', '.join(source_media)}")
-                logger.log(f"      Target media: {', '.join(target_media)}")
-                logger.log(f"      These may be intentionally separate editions. Verify before uploading.")
+                _out(
+                    "⚠️  WARNING: High confidence match but NO overlapping media types!",
+                    2,
+                )
+                _out(f"Source media: {', '.join(source_media)}", 6)
+                _out(f"Target media: {', '.join(target_media)}", 6)
+                _out(
+                    "These may be intentionally separate editions. Verify before uploading.",
+                    6,
+                )
         else:
-            logger.log("Target Edition: (none)")
+            _out("Target Edition: (none)")
         
-        logger.log("")
+        _out("")
         
         # Display media/encoding comparisons
-        for media_comp in comp.media_comparisons:
-            logger.log(f"  Media: {media_comp.media}")
-            
-            for enc_comp in media_comp.encodings:
-                logger.log(f"    Encoding: {enc_comp.encoding}")
+        for media_idx, media_comp in enumerate(comp.media_comparisons):
+            _out(f"Media: {media_comp.media}", 2)
+
+            sorted_encodings = sorted(media_comp.encodings, key=lambda enc: encoding_display_key(enc.encoding))
+            for enc_idx, enc_comp in enumerate(sorted_encodings):
+                _out(f"Encoding: {enc_comp.encoding}", 4)
                 
                 if enc_comp.source_torrent:
-                    logger.log(f"      Source: {source_name} Torrent {enc_comp.source_torrent.torrent_id} ({enc_comp.source_torrent.size:,})")
+                    _out(
+                        f"Source: {source_name} Torrent {enc_comp.source_torrent.torrent_id} "
+                        f"({enc_comp.source_torrent.size:,})",
+                        6,
+                    )
                 
                 if enc_comp.target_torrent:
-                    logger.log(f"      Target: {target_name} Torrent {enc_comp.target_torrent.torrent_id} ({enc_comp.target_torrent.size:,})")
+                    _out(
+                        f"Target: {target_name} Torrent {enc_comp.target_torrent.torrent_id} "
+                        f"({enc_comp.target_torrent.size:,})",
+                        6,
+                    )
                 
-                logger.log(f"      Status: {enc_comp.status}")
-                logger.log("")
-        
-        logger.log("")
+                _out(f"Status: {enc_comp.status}", 6)
+                if enc_idx < len(sorted_encodings) - 1:
+                    _out("")
+            if media_idx < len(comp.media_comparisons) - 1:
+                _out("")
+
+        # Single separator between edition blocks / following summary lines.
+        _out("")

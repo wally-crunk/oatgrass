@@ -65,7 +65,9 @@ class OatgrassLogger:
             if output.startswith(prefix):
                 text.stylize(style, 0, end)
                 return text
-        if output.startswith("   Candidate found: "):
+        if output.startswith("[Task ") or output.startswith("[End of Run]"):
+            text.stylize("cyan")
+        elif output.startswith("   Candidate found: "):
             text.stylize("yellow")
         elif output.startswith("   Match found on target. Not a candidate."):
             text.stylize("red")
@@ -74,10 +76,20 @@ class OatgrassLogger:
                 text.stylize("grey50", 0, quote_start)
                 text.stylize("yellow", quote_start, quote_end + 1)
         return text
+
+    @staticmethod
+    def _apply_indent(output: str, indent: int) -> str:
+        if indent <= 0:
+            return output
+        if output == "":
+            return ""
+        padding = " " * indent
+        return "\n".join(f"{padding}{line}" if line else "" for line in output.split("\n"))
     
-    def log(self, msg: str, prefix: str = ""):
+    def log(self, msg: str, prefix: str = "", indent: int = 0):
         """Log to screen and file"""
         output = f"{prefix}{msg}" if prefix else msg
+        output = self._apply_indent(output, max(0, indent))
         self._clear_status_line()
         
         # Screen (unbuffered)
@@ -90,17 +102,17 @@ class OatgrassLogger:
             import os
             os.fsync(self._file_handle.fileno())  # Force OS write
     
-    def info(self, msg: str):
+    def info(self, msg: str, indent: int = 0):
         """Info message"""
-        self.log(msg)
+        self.log(msg, indent=indent)
     
-    def warning(self, msg: str):
+    def warning(self, msg: str, indent: int = 0):
         """Warning message"""
-        self.log(msg, "[WARNING] ")
+        self.log(msg, "[WARNING] ", indent=indent)
     
-    def error(self, msg: str):
+    def error(self, msg: str, indent: int = 0):
         """Error message"""
-        self.log(msg, "[ERROR] ")
+        self.log(msg, "[ERROR] ", indent=indent)
     
     def api_wait(self, tracker: str, seconds: float):
         """Log API rate limiting wait"""
@@ -189,14 +201,14 @@ def get_logger() -> OatgrassLogger:
     return _logger
 
 # Convenience functions
-def log(msg: str):
-    get_logger().log(msg)
+def log(msg: str, prefix: str = "", indent: int = 0):
+    get_logger().log(msg, prefix=prefix, indent=indent)
 
-def info(msg: str):
-    get_logger().info(msg)
+def info(msg: str, indent: int = 0):
+    get_logger().info(msg, indent=indent)
 
-def warning(msg: str):
-    get_logger().warning(msg)
+def warning(msg: str, indent: int = 0):
+    get_logger().warning(msg, indent=indent)
 
-def error(msg: str):
-    get_logger().error(msg)
+def error(msg: str, indent: int = 0):
+    get_logger().error(msg, indent=indent)

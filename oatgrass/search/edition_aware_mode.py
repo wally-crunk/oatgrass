@@ -9,6 +9,7 @@ from oatgrass.search.edition_matcher import match_editions
 from oatgrass.search.edition_comparison import compare_editions
 from oatgrass.search.upload_candidates import find_upload_candidates
 from oatgrass.search.tier_search_service import search_with_tiers
+from oatgrass.search.formatters import format_task_context_line
 
 
 async def process_entry_edition_aware(
@@ -21,6 +22,7 @@ async def process_entry_edition_aware(
     
     abbrev: bool,
     verbose: bool,
+    show_context_line: bool = False,
 ) -> tuple[Optional[int], list[tuple[str, int]]]:
     """Process one entry with edition-aware search.
     
@@ -34,6 +36,18 @@ async def process_entry_edition_aware(
     
     if not source_gid:
         return None, []
+
+    def _emit_task_context(target_gid: int | None) -> None:
+        if show_context_line and not abbrev:
+            emit_func(
+                format_task_context_line(
+                    source_tracker.name,
+                    source_gid,
+                    opposite_tracker.name,
+                    target_gid,
+                ),
+                indent=3,
+            )
     
     # Fetch full source group
     group_response = await source_client.get_group(source_gid)
@@ -69,7 +83,9 @@ async def process_entry_edition_aware(
         matches = match_editions(source_group, None)
         comparisons = compare_editions(matches)
         candidates = find_upload_candidates(comparisons)
-        
+
+        _emit_task_context(None)
+
         if candidates:
             urls_with_priority = [(f"{source_tracker.url.rstrip('/')}/torrents.php?torrentid={c.source_torrent.torrent_id}", c.priority) for c in candidates]
             if not abbrev:
@@ -93,17 +109,28 @@ async def process_entry_edition_aware(
     matches = match_editions(source_group, target_group, min_confidence=25)
     comparisons = compare_editions(matches)
     candidates = find_upload_candidates(comparisons)
+
+    _emit_task_context(target_group.group_id)
     
     # Verbose mode: show detailed edition analysis
     if verbose and not abbrev:
         from oatgrass.search.edition_display import display_edition_matches
         from oatgrass.search.edition_comparison import display_edition_comparisons
-        
-        emit_func("\n   Edition Matching:", indent=3)
-        display_edition_matches(matches, min_confidence=25)
-        
-        emit_func("\n   Media/Encoding Comparison:", indent=3)
-        display_edition_comparisons(comparisons, source_tracker.name.upper(), opposite_tracker.name.upper())
+
+        emit_func("")
+        emit_func("Edition Matching:", indent=3)
+        display_edition_matches(matches, min_confidence=25, emit_func=emit_func, base_indent=3)
+
+        emit_func("")
+        emit_func("Media/Encoding Comparison:", indent=3)
+        display_edition_comparisons(
+            comparisons,
+            source_tracker.name.upper(),
+            opposite_tracker.name.upper(),
+            emit_func=emit_func,
+            base_indent=3,
+            show_tracker_summary=not show_context_line,
+        )
     elif not abbrev:
         # In normal mode, show warning if any comparison has media mismatch
         for comp in comparisons:

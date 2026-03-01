@@ -589,32 +589,65 @@ def _run_group_search_prompt(config: OatgrassConfig) -> None:
             console.print(f"  [{key}] {label}")
         return _ui_prompt(prompt_label, default=default).strip().upper()
 
-    search_mode_target = _strip_surrounding_quotes(_ui_prompt("Collage or group URL/ID").strip())
+    search_mode_target = _strip_surrounding_quotes(_ui_prompt("Enter Group/Collage URL or ID").strip())
 
-    tracker_key = None
+    tracker_key: str | None = None
     if not (search_mode_target.startswith("http://") or search_mode_target.startswith("https://")):
-        tracker_choice = _prompt_menu_choice(
-            "Source tracker (for bare ID)",
-            "Source tracker",
-            [("R", "RED (default)"), ("O", "OPS")],
-            default="R",
+        if not search_mode_target.isdigit() or int(search_mode_target) <= 0:
+            _ui_warn("Bare ID must be a positive integer.")
+            return
+
+        id_type = _prompt_menu_choice(
+            "ID type (for bare ID)",
+            "ID type",
+            [
+                ("G", "Group ID (default)"),
+                ("C", "Collage ID"),
+            ],
+            default="G",
         )
-        tracker_key = "ops" if tracker_choice == "O" else "red"
+        if id_type not in {"G", "C"}:
+            _ui_warn(f"Unknown ID type '{id_type}'. Defaulting to G.")
+            id_type = "G"
+
+        tracker_lookup = {key.upper(): key for key in config.trackers}
+        default_tracker = max(tracker_lookup)
+        tracker_choice = _prompt_menu_choice(
+            "Tracker (for bare ID)",
+            "Tracker",
+            [
+                (upper, f"{config.trackers[key].name.upper()} ({config.trackers[key].url})")
+                for upper, key in tracker_lookup.items()
+            ],
+            default=default_tracker,
+        )
+        selected_tracker_key = tracker_lookup.get(tracker_choice)
+        if selected_tracker_key is None:
+            _ui_warn(f"Unknown tracker '{tracker_choice}'. Defaulting to {default_tracker}.")
+            selected_tracker_key = tracker_lookup[default_tracker]
+
+        if id_type == "C":
+            collage_tracker = config.trackers[selected_tracker_key]
+            search_mode_target = f"{collage_tracker.url.rstrip('/')}/collages.php?id={search_mode_target}"
+        else:
+            tracker_key = selected_tracker_key
 
     output_choice = _prompt_menu_choice(
         "Output mode",
         "Output mode",
         [
             ("A", "Abbreviated - One line per group"),
-            ("N", "Normal (default) - Album matching + brief candidate summary"),
-            ("V", "Verbose - Full edition details, confidence scores"),
+            ("Q", "Quiet - Album matching + brief candidate summary"),
+            ("V", "Verbose (default) - Full edition details, confidence scores"),
             ("D", "Debug - API calls, JSON responses, timestamps"),
         ],
-        default="N",
+        default="V",
     )
     abbrev = output_choice == "A"
     verbose = output_choice == "V"
     debug = output_choice == "D"
+    if output_choice == "N":
+        verbose = False
 
     if _has_scipy():
         matching_choice = _prompt_menu_choice(
@@ -716,37 +749,91 @@ def _format_seconds_value(seconds: float) -> str:
     return f"{seconds:.1f}"
 
 
+def _help_header() -> str:
+    return f"OATGRASS v{getattr(pkg, '__version__', '0.0.0')} - Find candidates for cross-uploading"
+
+
 def show_help(parser: argparse.ArgumentParser) -> None:
-    print(f"OATGRASS v{getattr(pkg, '__version__', '0.0.0')} - Find candidates for cross-uploading")
+    print(_help_header())
     print()
     parser.print_help()
+
+
+def _resolve_cli_output_modes(args: argparse.Namespace) -> tuple[bool, bool, bool]:
+    quiet_count = int(getattr(args, "quiet", 0) or 0)
+    debug = bool(getattr(args, "debug", False))
+    verbose_flag = bool(getattr(args, "verbose", False))
+    normal_flag = bool(getattr(args, "normal", False))
+    abbrev_flag = bool(getattr(args, "abbrev", False))
+    quiet_flag = bool(getattr(args, "quieter", False)) or quiet_count > 0
+
+    if sum(bool(x) for x in (debug, verbose_flag, normal_flag, abbrev_flag, quiet_flag)) > 1:
+        raise ValueError("Cannot combine output modes; choose one of --debug, --verbose, --normal, --abbrev, --quiet/--quieter")
+    if debug:
+        return False, False, True
+    if abbrev_flag or getattr(args, "quieter", False) or quiet_count >= 2:
+        return True, False, False
+    if normal_flag or quiet_count == 1:
+        return False, False, False
+    return False, True, False
+
+
+def _emit_deprecated_output_flag_warnings(args: argparse.Namespace) -> None:
+    deprecated_flags = (
+        ("--abbrev", bool(getattr(args, "abbrev", False))),
+        ("--normal", bool(getattr(args, "normal", False))),
+        ("--verbose", bool(getattr(args, "verbose", False))),
+    )
+    for flag, used in deprecated_flags:
+        if used:
+            _ui_warn(f"{flag}: That's a deprecated parameter, it will go away in the next release.")
 
 
 def main():
     """Entry point"""
     _reset_cli_session_timer()
-    parser = argparse.ArgumentParser(add_help=False)
-    for args, kwargs in (
-        (("-h", "--help"), {"action": "store_true", "help": "Show help"}),
-        (("--verify",), {"action": "store_true", "help": "Verify keys and exit"}),
-        (("-c", "--config"), {"metavar": "PATH", "help": "Path to config.toml (file or directory)"}),
-        (("-o", "--output"), {"metavar": "DIR", "help": "Output directory for run logs (default: ./output)"}),
-        (("-a", "--abbrev"), {"action": "store_true", "help": "Abbreviated output for search mode"}),
-        (("-n", "--normal"), {"action": "store_true", "help": "Normal output mode (default)"}),
-        (("-v", "--verbose"), {"action": "store_true", "help": "Verbose output with full edition details"}),
-        (("-d", "--debug"), {"action": "store_true", "help": "Debug mode with API calls, JSON responses, timestamps"}),
-        (("--search-editions",), {"action": "store_true", "help": "Search at edition level (default)"}),
-        (("--search-groups",), {"action": "store_true", "help": "Search at group level (ignore editions)"}),
-        (("--no-discogs",), {"action": "store_true", "help": "Disable Discogs artist name variation (disable tier 5)"}),
-        (("--no-fallback",), {"action": "store_true", "help": "No fallback tiers, exact match only (disable tiers 2-5)"}),
-    ):
-        parser.add_argument(*args, **kwargs)
+    parser = argparse.ArgumentParser(
+        prog="oatgrass",
+        usage=(
+            "oatgrass [-h] [--verify] [-c PATH] [-o DIR] "
+            "[--version] "
+            "[--search-editions|--search-groups] [--no-discogs] [--no-fallback] "
+            "[--debug | -q | -qq | --quieter | -a | -n | -v] [url_or_id]"
+        ),
+        add_help=False,
+        formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=25),
+    )
+    general = parser.add_argument_group("general options")
+    general.add_argument("-h", "--help", action="store_true", help="Show help")
+    general.add_argument("--version", action="store_true", help="Show version and exit")
+    general.add_argument("--verify", action="store_true", help="Verify keys and exit")
+    general.add_argument("-c", "--config", metavar="PATH", help="Path to config.toml (file or directory)")
+    general.add_argument("-o", "--output", metavar="DIR", help="Output directory for run logs (default: ./output)")
+
+    search_behavior = parser.add_argument_group("search behavior")
+    search_behavior.add_argument("--search-editions", action="store_true", help="Search at edition level (default)")
+    search_behavior.add_argument("--search-groups", action="store_true", help="Search at group level (ignore editions)")
+    search_behavior.add_argument("--no-discogs", action="store_true", help="Disable Discogs artist name variation (disable tier 5)")
+    search_behavior.add_argument("--no-fallback", action="store_true", help="No fallback tiers, exact match only (disable tiers 2-5)")
+
+    output_mode = parser.add_argument_group("output mode (choose one)")
+    output_mode.add_argument("-q", "--quiet", action="count", default=0, help="Reduce output volume one level")
+    output_mode.add_argument("-qq", "--quieter", action="store_true", help="Reduce output volume two levels; minimal output")
+    output_mode.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
+
+    legacy = parser.add_argument_group("legacy output aliases (deprecated)")
+    legacy.add_argument("-a", "--abbrev", action="store_true", help="Legacy alias for -qq/--quieter")
+    legacy.add_argument("-n", "--normal", action="store_true", help="Legacy alias for -q/--quiet")
+    legacy.add_argument("-v", "--verbose", action="store_true", help="Legacy alias for default verbose output")
     parser.add_argument('url_or_id', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
         args = parser.parse_args()
         if args.help:
             show_help(parser)
+            sys.exit(0)
+        if args.version:
+            print(_help_header())
             sys.exit(0)
 
         def resolve_config_path(args_config: Optional[str]) -> Path:
@@ -773,9 +860,11 @@ def main():
         _emit_scipy_startup_warning_once()
         
         if args.url_or_id:
-            # Check for conflicting flags
-            if sum([args.abbrev, args.verbose, args.debug]) > 1:
-                _ui_error("Cannot use multiple output modes (--abbrev, --verbose, --debug)")
+            _emit_deprecated_output_flag_warnings(args)
+            try:
+                abbrev, verbose, debug = _resolve_cli_output_modes(args)
+            except ValueError as exc:
+                _ui_error(str(exc))
                 sys.exit(1)
             if args.search_editions and args.search_groups:
                 _ui_error("Cannot use both --search-editions and --search-groups")
@@ -791,9 +880,9 @@ def main():
                     config,
                     args.url_or_id,
                     strict=args.no_fallback,
-                    abbrev=args.abbrev,
-                    verbose=args.verbose,
-                    debug=args.debug,
+                    abbrev=abbrev,
+                    verbose=verbose,
+                    debug=debug,
                     basic=basic_mode,
                     no_discogs=args.no_discogs,
                     output_dir=output_dir,
