@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +20,17 @@ from oatgrass.search.resilience import (
     run_with_retries,
 )
 from oatgrass.search.group_search import _next_run_path, _pick_opposite_tracker
+from oatgrass.search.candidate_policy import (
+    CandidatePolicy,
+    PolicySummary,
+    apply_candidate_policy,
+)
+from oatgrass.search.policy_enrichment import enrich_red_policy_fields
+from oatgrass.search.policy_candidate_resolution import (
+    build_no_match_candidates_from_torrent,
+    resolve_policy_candidates,
+)
+from oatgrass.tracker_profile import tracker_needs_policy_enrichment
 
 PROFILE_SEARCH_PROGRESS_HEARTBEAT_SECONDS = 5.0
 PROFILE_ENTRY_MAX_ATTEMPTS = 3
@@ -30,6 +41,14 @@ class ProfileSearchResult:
     processed: int
     skipped: int
     candidate_urls: list[tuple[str, int]]
+    policy_summary: PolicySummary
+
+
+@dataclass(frozen=True)
+class ProfileEntryEvaluation:
+    candidate_urls: list[tuple[str, int]]
+    suppressed_messages: list[str]
+    policy_summary: PolicySummary
 
 
 @dataclass
@@ -41,6 +60,17 @@ class _ProgressState:
     candidates: int = 0
     current_index: int = 0
     done: bool = False
+
+
+@dataclass
+class _ProfileLookupCache:
+    # Group-scoped caches trim repeated source/target API calls for profile rows
+    # that share the same source group_id.
+    source_group_payloads: dict[int, tuple[dict, list[dict]]] = field(default_factory=dict)
+    source_browse_results: dict[int, dict | None] = field(default_factory=dict)
+    target_results: dict[int, dict | None] = field(default_factory=dict)
+    target_groups: dict[int, object] = field(default_factory=dict)
+    enrichment_torrents: dict[int, dict] = field(default_factory=dict)
 
 
 def _render_progress_line(state: _ProgressState) -> str:
@@ -97,9 +127,9 @@ def _filter_candidates_for_source_torrent(candidates: Iterable[object], source_t
     return [c for c in candidates if getattr(c.source_torrent, "torrent_id", None) == source_torrent_id]
 
 
-def _skip_entry(message: str) -> tuple[list[tuple[str, int]], bool]:
+def _skip_entry(message: str) -> tuple[ProfileEntryEvaluation, bool]:
     logger.warning(message)
-    return [], True
+    return ProfileEntryEvaluation(candidate_urls=[], suppressed_messages=[], policy_summary=PolicySummary()), True
 
 
 def _enrich_profile_entry(
@@ -119,12 +149,23 @@ def _enrich_profile_entry(
     )
 
 
+def _parse_group_payload(payload: dict, *, context: str) -> tuple[dict, list[dict]]:
+    response = response_payload(payload, context)
+    group_data = response.get("group", {})
+    if not isinstance(group_data, dict):
+        group_data = {}
+    torrents = response.get("torrents", [])
+    if not isinstance(torrents, list):
+        torrents = []
+    return group_data, torrents
+
+
 async def _find_source_browse_result(
     source_client: GazelleServiceAdapter,
     artist: str,
     album: str | None,
     year: int | None,
-    group_id: int,
+    group_id: int | None,
 ) -> dict | None:
     browse = await source_client.search(artistname=artist, groupname=album, year=year)
     response = response_payload(browse, "Source browse search")
@@ -145,8 +186,10 @@ async def _evaluate_profile_entry(
     source_client: GazelleServiceAdapter,
     target_client: GazelleServiceAdapter,
     group_only: bool = False,
+    candidate_policy: CandidatePolicy = CandidatePolicy.STANDARD,
     candidate_resolver=None,
-) -> tuple[list[tuple[str, int]], bool]:
+    lookup_cache: _ProfileLookupCache | None = None,
+) -> tuple[ProfileEntryEvaluation, bool]:
     """Return candidate URLs and whether entry was skipped."""
     from oatgrass.search.edition_parser import parse_group_from_browse, parse_group_hybrid
     from oatgrass.search.tier_search_service import search_with_tiers
@@ -169,14 +212,18 @@ async def _evaluate_profile_entry(
             return _skip_entry(f"Skipping torrent {entry.torrent_id}: no group id in torrent payload")
         entry = _enrich_profile_entry(entry, inferred_group_id, source_torrent)
     else:
-        source_group_response = await source_client.get_group(entry.group_id)
-        group_response = response_payload(source_group_response, "Source group")
-        group_data = group_response.get("group", {})
-        if not isinstance(group_data, dict):
-            group_data = {}
-        torrents = group_response.get("torrents", [])
-        if not isinstance(torrents, list):
-            torrents = []
+        cached_group = (
+            lookup_cache.source_group_payloads.get(entry.group_id)
+            if lookup_cache is not None
+            else None
+        )
+        if cached_group is None:
+            source_group_response = await source_client.get_group(entry.group_id)
+            group_data, torrents = _parse_group_payload(source_group_response, context="Source group")
+            if lookup_cache is not None:
+                lookup_cache.source_group_payloads[entry.group_id] = (group_data, torrents)
+        else:
+            group_data, torrents = cached_group
         source_torrent = _find_torrent_in_group(torrents, entry.torrent_id) if entry.torrent_id is not None else None
         if not source_torrent and entry.torrent_id is not None:
             torrent_response = await source_client.get_torrent(entry.torrent_id)
@@ -206,52 +253,104 @@ async def _evaluate_profile_entry(
     group_year = group_data.get("year")
     search_artist = group_artist or (entry.artist_name or group_name)
 
-    source_browse_result = await _find_source_browse_result(
-        source_client,
-        artist=search_artist,
-        album=group_name,
-        year=group_year,
-        group_id=entry.group_id,
-    )
+    source_browse_result = None
+    if entry.group_id is not None and lookup_cache is not None and entry.group_id in lookup_cache.source_browse_results:
+        source_browse_result = lookup_cache.source_browse_results[entry.group_id]
+    else:
+        source_browse_result = await _find_source_browse_result(
+            source_client,
+            artist=search_artist,
+            album=group_name,
+            year=group_year,
+            group_id=entry.group_id,
+        )
+        if entry.group_id is not None and lookup_cache is not None:
+            lookup_cache.source_browse_results[entry.group_id] = source_browse_result
 
     source_group = parse_group_hybrid(
         group_data, [source_torrent], source_browse_result, source_tracker.name.upper()
     )
 
-    target_result = await search_with_tiers(
-        target_client,
-        artist=search_artist,
-        album=group_name,
-        year=group_year,
-    )
+    if entry.group_id is not None and lookup_cache is not None and entry.group_id in lookup_cache.target_results:
+        target_result = lookup_cache.target_results[entry.group_id]
+    else:
+        target_result = await search_with_tiers(
+            target_client,
+            artist=search_artist,
+            album=group_name,
+            year=group_year,
+        )
+        if entry.group_id is not None and lookup_cache is not None:
+            lookup_cache.target_results[entry.group_id] = target_result
     if not target_result:
-        return _to_candidate_urls(source_tracker, [(entry.torrent_id, 100)]), False
+        source_edition = source_group.editions[0] if source_group.editions else None
+        source_info = source_edition.torrents[0] if source_edition and source_edition.torrents else None
+        if source_info is None:
+            return (
+                ProfileEntryEvaluation(
+                    candidate_urls=_to_candidate_urls(source_tracker, [(entry.torrent_id, 100)]),
+                    suppressed_messages=[],
+                    policy_summary=PolicySummary(),
+                ),
+                False,
+            )
+        no_target_candidates = build_no_match_candidates_from_torrent(
+            source_info,
+            edition_id=source_edition.edition_id if source_edition else None,
+            edition_year=(source_edition.year or 0) if source_edition else 0,
+            edition_title=(source_edition.title or "(no title)") if source_edition else "(no title)",
+            priority=100,
+        )
+        candidate_urls, suppressed_messages, policy_summary = await resolve_policy_candidates(
+            no_target_candidates,
+            source_tracker=source_tracker,
+            source_client=source_client,
+            policy=candidate_policy,
+            enrichment_cache=lookup_cache.enrichment_torrents if lookup_cache is not None else None,
+        )
+        return (
+            ProfileEntryEvaluation(
+                candidate_urls=candidate_urls,
+                suppressed_messages=suppressed_messages,
+                policy_summary=policy_summary,
+            ),
+            False,
+        )
     if group_only:
-        return [], False
+        return ProfileEntryEvaluation(candidate_urls=[], suppressed_messages=[], policy_summary=PolicySummary()), False
 
     if opposite_tracker.name.lower() == "red":
         target_gid = int(target_result.get("groupId"))
-        target_group_response = await target_client.get_group(target_gid)
-        target_response = response_payload(target_group_response, "Target group")
-        target_group_data = target_response.get("group", {})
-        if not isinstance(target_group_data, dict):
-            target_group_data = {}
-        target_torrents = target_response.get("torrents", [])
-        if not isinstance(target_torrents, list):
-            target_torrents = []
-        target_group = parse_group_hybrid(
-            target_group_data,
-            target_torrents,
-            target_result,
-            opposite_tracker.name.upper(),
+        target_group = (
+            lookup_cache.target_groups.get(target_gid)
+            if lookup_cache is not None
+            else None
         )
+        if target_group is None:
+            target_group_response = await target_client.get_group(target_gid)
+            target_group_data, target_torrents = _parse_group_payload(target_group_response, context="Target group")
+            target_group = parse_group_hybrid(
+                target_group_data,
+                target_torrents,
+                target_result,
+                opposite_tracker.name.upper(),
+            )
+            if lookup_cache is not None:
+                lookup_cache.target_groups[target_gid] = target_group
     else:
         target_group = parse_group_from_browse(target_result, opposite_tracker.name.upper())
 
     if candidate_resolver is not None:
         resolved = candidate_resolver(source_group, target_group)
         filtered = [(torrent_id, priority) for torrent_id, priority in resolved if torrent_id == entry.torrent_id]
-        return _to_candidate_urls(source_tracker, filtered), False
+        return (
+            ProfileEntryEvaluation(
+                candidate_urls=_to_candidate_urls(source_tracker, filtered),
+                suppressed_messages=[],
+                policy_summary=PolicySummary(),
+            ),
+            False,
+        )
 
     from oatgrass.search.edition_comparison import compare_editions
     from oatgrass.search.edition_matcher import match_editions
@@ -259,12 +358,43 @@ async def _evaluate_profile_entry(
 
     matches = match_editions(source_group, target_group, min_confidence=25)
     comparisons = compare_editions(matches)
+    upload_candidates = find_upload_candidates(comparisons)
+    if candidate_policy != CandidatePolicy.STANDARD and tracker_needs_policy_enrichment(source_tracker.name):
+        enrichment_cache = lookup_cache.enrichment_torrents if lookup_cache is not None else None
+        if enrichment_cache is None:
+            await enrich_red_policy_fields(source_client, upload_candidates)
+        else:
+            await enrich_red_policy_fields(
+                source_client,
+                upload_candidates,
+                torrent_payload_cache=enrichment_cache,
+            )
+    policy_outcome = apply_candidate_policy(upload_candidates, policy=candidate_policy)
     filtered_candidates = [
-        c for c in find_upload_candidates(comparisons)
+        c for c in policy_outcome.candidates
         if getattr(c.source_torrent, "torrent_id", None) == entry.torrent_id
     ]
+    filtered_suppressed = [
+        s for s in policy_outcome.suppressed
+        if getattr(s.candidate.source_torrent, "torrent_id", None) == entry.torrent_id
+    ]
     candidates = [(candidate.source_torrent.torrent_id, candidate.priority) for candidate in filtered_candidates]
-    return _to_candidate_urls(source_tracker, candidates), False
+    suppressed_messages = [
+        (
+            "Suppressed: "
+            f"{_cross_upload_torrent_url(source_tracker, item.candidate.source_torrent.torrent_id)} "
+            f"({item.reason_text})"
+        )
+        for item in filtered_suppressed
+    ]
+    return (
+        ProfileEntryEvaluation(
+            candidate_urls=_to_candidate_urls(source_tracker, candidates),
+            suppressed_messages=suppressed_messages,
+            policy_summary=policy_outcome.summary,
+        ),
+        False,
+    )
 
 
 async def run_profile_search_workflow(
@@ -273,6 +403,8 @@ async def run_profile_search_workflow(
     list_type: ListType,
     entries: list[ProfileTorrent],
     group_only: bool = False,
+    candidate_policy: CandidatePolicy = CandidatePolicy.STANDARD,
+    abbrev: bool = False,
     output_dir: Path | None = None,
 ) -> ProfileSearchResult:
     source_key, source_tracker = resolve_profile_tracker(config, source_tracker_key)
@@ -286,11 +418,16 @@ async def run_profile_search_workflow(
     logger.info(f"List: {list_type}")
     logger.info(f"Rows: {len(entries)}")
     logger.info(f"Matching mode: {'Group-only' if group_only else 'Edition-aware'}")
+    logger.info(f"Candidate policy: {candidate_policy.value}")
+    if candidate_policy != CandidatePolicy.STANDARD:
+        logger.info(f"Policy rules: evaluating {len(entries)} source torrent(s) at startup.")
 
     source_client = GazelleServiceAdapter(source_tracker)
     target_client = GazelleServiceAdapter(opposite_tracker)
     skipped = 0
     candidates: list[tuple[str, int]] = []
+    policy_summary = PolicySummary()
+    lookup_cache = _ProfileLookupCache()
     progress = _ProgressState(total=len(entries), started_at=time.monotonic())
     heartbeat_task = asyncio.create_task(_progress_heartbeat(progress))
     try:
@@ -309,10 +446,10 @@ async def run_profile_search_workflow(
                 f"   {source_tracker.name.lower()} group #{group_id} "
                 f"torrent #{torrent_id} '{entry.group_name or ''}'"
             )
-            entry_candidates: list[tuple[str, int]] = []
+            evaluation = ProfileEntryEvaluation(candidate_urls=[], suppressed_messages=[], policy_summary=PolicySummary())
             was_skipped = False
             try:
-                entry_candidates, was_skipped = await run_with_retries(
+                evaluation, was_skipped = await run_with_retries(
                     lambda: _evaluate_profile_entry(
                         entry,
                         source_tracker,
@@ -320,6 +457,8 @@ async def run_profile_search_workflow(
                         source_client,
                         target_client,
                         group_only=group_only,
+                        candidate_policy=candidate_policy,
+                        lookup_cache=lookup_cache,
                     ),
                     max_attempts=PROFILE_ENTRY_MAX_ATTEMPTS,
                     on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
@@ -335,12 +474,20 @@ async def run_profile_search_workflow(
 
             if was_skipped:
                 skipped += 1
-            elif entry_candidates:
+            else:
+                policy_summary.merge(evaluation.policy_summary)
+                if evaluation.suppressed_messages and not abbrev:
+                    for message in evaluation.suppressed_messages:
+                        logger.info(f"   {message}")
+
+            if was_skipped:
+                pass
+            elif evaluation.candidate_urls:
                 logger.info(
-                    f"   Candidate found: {len(entry_candidates)} candidate(s) "
+                    f"   Candidate found: {len(evaluation.candidate_urls)} candidate(s) "
                     f"for source torrent #{entry.torrent_id}"
                 )
-                candidates.extend(entry_candidates)
+                candidates.extend(evaluation.candidate_urls)
             else:
                 logger.info("   Match found on target. Not a candidate.")
 
@@ -359,6 +506,13 @@ async def run_profile_search_workflow(
         logger.get_logger().clear_status()
         await source_client.close()
         await target_client.close()
+        if candidate_policy != CandidatePolicy.STANDARD:
+            logger.info("[Policy Summary]")
+            logger.info(f"   Promoted: {policy_summary.promoted}")
+            logger.info(f"   Demoted: {policy_summary.demoted}")
+            logger.info(f"   Excluded by policy: {policy_summary.excluded_by_policy}")
+            logger.info(f"   Dropped duplicate 24-bit Vinyl: {policy_summary.duplicate_24bit}")
+            logger.info(f"   Suppressed total: {policy_summary.suppressed_total}")
         logger.info(f"Output mirrored to {log_path}")
         logger.get_logger().close()
 
@@ -368,4 +522,5 @@ async def run_profile_search_workflow(
         processed=processed,
         skipped=skipped,
         candidate_urls=candidates,
+        policy_summary=policy_summary,
     )
