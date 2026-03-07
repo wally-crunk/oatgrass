@@ -13,6 +13,7 @@ from oatgrass import logger
 class UploadCandidate:
     """Single upload candidate with context."""
     source_torrent: TorrentInfo
+    edition_id: int | None
     edition_year: int
     edition_title: str
     media: str
@@ -40,6 +41,7 @@ def _build_candidate(
     assert source_torrent is not None
     return UploadCandidate(
         source_torrent=source_torrent,
+        edition_id=edition.edition_id,
         edition_year=edition.year or 0,
         edition_title=edition.title or "(no title)",
         media=media,

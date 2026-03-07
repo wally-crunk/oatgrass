@@ -27,6 +27,14 @@ class TorrentInfo:
     remaster_title: Optional[str] = None
     remaster_label: Optional[str] = None
     remaster_catalog: Optional[str] = None
+    has_log: Optional[bool] = None
+    has_cue: Optional[bool] = None
+    log_score: Optional[int] = None
+    log_checksum: Optional[bool] = None
+    trumpable: Optional[bool] = None
+    trumpable_reasons: List[str] = field(default_factory=list)
+    description: Optional[str] = None
+    file_list: Optional[str] = None
 
 
 @dataclass
