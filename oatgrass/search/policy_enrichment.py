@@ -8,6 +8,19 @@ from oatgrass.search.gazelle_client import GazelleServiceAdapter
 from oatgrass.search.upload_candidates import UploadCandidate
 
 
+def _is_flac(candidate: UploadCandidate) -> bool:
+    return "flac" in (candidate.source_torrent.format or "").lower()
+
+
+def _needs_red_policy_enrichment(candidate: UploadCandidate) -> bool:
+    source = candidate.source_torrent
+    if not _is_flac(candidate):
+        return False
+    if source.trumpable is None:
+        return True
+    return source.trumpable is True and not source.trumpable_reasons
+
+
 def _as_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -42,12 +55,9 @@ async def enrich_red_policy_fields(
     """
     by_torrent_id: dict[int, list[UploadCandidate]] = {}
     for candidate in candidates:
-        source = candidate.source_torrent
-        if source.trumpable is not True:
+        if not _needs_red_policy_enrichment(candidate):
             continue
-        if source.trumpable_reasons:
-            continue
-        by_torrent_id.setdefault(source.torrent_id, []).append(candidate)
+        by_torrent_id.setdefault(candidate.source_torrent.torrent_id, []).append(candidate)
 
     for torrent_id, bucket in by_torrent_id.items():
         payload = (
@@ -67,6 +77,7 @@ async def enrich_red_policy_fields(
         reasons = _parse_reason_list(torrent.get("trumpable_reasons"), torrent.get("trumpableReasons"))
         description = torrent.get("description") if isinstance(torrent.get("description"), str) else None
         log_checksum = _as_bool(torrent.get("logChecksum"))
+        trumpable = _as_bool(torrent.get("trumpable"))
 
         for candidate in bucket:
             source = candidate.source_torrent
@@ -75,3 +86,5 @@ async def enrich_red_policy_fields(
                 source.description = description
             if source.log_checksum is None and log_checksum is not None:
                 source.log_checksum = log_checksum
+            if source.trumpable is None and trumpable is not None:
+                source.trumpable = trumpable
