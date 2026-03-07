@@ -30,6 +30,7 @@ try:
     from .profile.session_state import ProfileSessionState
     from .profile.tracker_selection import configured_profile_trackers, resolve_profile_tracker
     from .search.group_search import run_group_search_workflow, _next_run_path
+    from .search.candidate_policy import CandidatePolicy, PolicySummary, parse_candidate_policy
     from .tracker_profile import resolve_tracker_profile
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
@@ -113,6 +114,16 @@ def _ui_prompt_yesno(
     if allow_cancel and first in {"c", "x"}:
         return False
     return default_yes
+
+
+def _resolve_candidate_policy_from_flags(args: argparse.Namespace) -> CandidatePolicy:
+    policy = parse_candidate_policy(
+        perfect=bool(getattr(args, "perfect", False)),
+        perfecter=bool(getattr(args, "perfecter", False)),
+    )
+    if bool(getattr(args, "perfect", False)) and bool(getattr(args, "perfecter", False)):
+        _ui_warn("Both --perfect and --perfecter were provided; using --perfecter.")
+    return policy
 
 
 def _reset_cli_session_timer() -> None:
@@ -316,6 +327,16 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
         _ui_info(f"Selected lists: {', '.join(selected_with_rows)}")
     total_rows = sum(len(cache.get_list(tracker_key, list_type)) for list_type in selected_with_rows)
     _show_profile_search_estimate(config, tracker_key, selected_with_rows[0], total_rows)
+    console.print("\nCandidate policy:")
+    console.print("  [A] All (default) - current behavior")
+    console.print("  [P] Perfect - FLAC-only, quality scoring")
+    console.print("  [R] Perfecter - stricter media/encoding policy")
+    policy_choice = _ui_prompt("Candidate policy", default="A").strip().upper()
+    candidate_policy = {
+        "A": CandidatePolicy.STANDARD,
+        "P": CandidatePolicy.PERFECT,
+        "R": CandidatePolicy.PERFECTER,
+    }.get(policy_choice, CandidatePolicy.STANDARD)
     if not _ui_prompt_yesno("Continue profile search?", default_yes=True, allow_cancel=True):
         _ui_prompt("Press Enter to continue", default="")
         return
@@ -323,6 +344,7 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
     total_processed = 0
     total_skipped = 0
     all_candidates: list[tuple[str, int]] = []
+    aggregate_policy_summary = PolicySummary()
     for list_type in selected_with_rows:
         entries = cache.get_list(tracker_key, list_type)
         _ui_info(f"Running profile search for '{list_type}' ({len(entries)} row(s))")
@@ -333,14 +355,21 @@ def _handle_profile_search_action(config: OatgrassConfig, cache: ProfileSessionS
                 list_type=list_type,
                 entries=entries,
                 group_only=group_only_mode,
+                candidate_policy=candidate_policy,
             )
         )
         total_processed += result.processed
         total_skipped += result.skipped
         all_candidates.extend(result.candidate_urls)
+        aggregate_policy_summary.merge(getattr(result, "policy_summary", PolicySummary()))
 
     deduped_candidates = list(dict.fromkeys(all_candidates))
-    _display_profile_search_result(deduped_candidates, total_processed, total_skipped)
+    _display_profile_search_result(
+        deduped_candidates,
+        total_processed,
+        total_skipped,
+        aggregate_policy_summary if candidate_policy != CandidatePolicy.STANDARD else None,
+    )
     _ui_prompt("Press Enter to continue", default="")
 
 
@@ -649,6 +678,22 @@ def _run_group_search_prompt(config: OatgrassConfig) -> None:
     if output_choice == "N":
         verbose = False
 
+    policy_choice = _prompt_menu_choice(
+        "Candidate policy",
+        "Candidate policy",
+        [
+            ("A", "All (default) - current behavior"),
+            ("P", "Perfect - FLAC-only, quality scoring"),
+            ("R", "Perfecter - stricter media/encoding policy"),
+        ],
+        default="A",
+    )
+    candidate_policy = {
+        "A": CandidatePolicy.STANDARD,
+        "P": CandidatePolicy.PERFECT,
+        "R": CandidatePolicy.PERFECTER,
+    }.get(policy_choice, CandidatePolicy.STANDARD)
+
     if _has_scipy():
         matching_choice = _prompt_menu_choice(
             "Matching mode",
@@ -686,17 +731,32 @@ def _run_group_search_prompt(config: OatgrassConfig) -> None:
         debug=debug,
         basic=basic,
         no_discogs=no_discogs,
+        candidate_policy=candidate_policy,
     ))
 
 
-def _display_profile_search_result(candidate_urls: list[tuple[str, int]], processed: int, skipped: int) -> None:
+def _display_profile_search_result(
+    candidate_urls: list[tuple[str, int]],
+    processed: int,
+    skipped: int,
+    policy_summary: PolicySummary | None = None,
+) -> None:
     _ui_info(f"Profile search processed={processed}, skipped={skipped}")
     if not candidate_urls:
         _ui_info("No cross-upload candidates found for cached rows.")
-        return
-    _ui_info("Candidate source torrents to review:")
-    for url, priority in sorted(candidate_urls, key=lambda item: item[1], reverse=True):
-        console.print(f"  Priority {priority}: {url}")
+    else:
+        _ui_info("Candidate source torrents to review:")
+        for url, priority in sorted(candidate_urls, key=lambda item: item[1], reverse=True):
+            console.print(f"  Priority {priority}: {url}")
+    if policy_summary is not None:
+        _ui_info(
+            "Policy summary: "
+            f"promoted={policy_summary.promoted}, "
+            f"demoted={policy_summary.demoted}, "
+            f"excluded_by_policy={policy_summary.excluded_by_policy}, "
+            f"duplicate_24bit={policy_summary.duplicate_24bit}, "
+            f"suppressed_total={policy_summary.suppressed_total}"
+        )
 
 
 def _show_profile_search_estimate(
@@ -797,7 +857,7 @@ def main():
         usage=(
             "oatgrass [-h] [--verify] [-c PATH] [-o DIR] "
             "[--version] "
-            "[--search-editions|--search-groups] [--no-discogs] [--no-fallback] "
+            "[--search-editions|--search-groups] [--no-discogs] [--no-fallback] [--perfect|--perfecter] "
             "[--debug | -q | -qq | --quieter | -a | -n | -v] [url_or_id]"
         ),
         add_help=False,
@@ -815,6 +875,16 @@ def main():
     search_behavior.add_argument("--search-groups", action="store_true", help="Search at group level (ignore editions)")
     search_behavior.add_argument("--no-discogs", action="store_true", help="Disable Discogs artist name variation (disable tier 5)")
     search_behavior.add_argument("--no-fallback", action="store_true", help="No fallback tiers, exact match only (disable tiers 2-5)")
+    search_behavior.add_argument(
+        "--perfect",
+        action="store_true",
+        help="Perfect policy: FLAC-only quality scoring (+20/-20)",
+    )
+    search_behavior.add_argument(
+        "--perfecter",
+        action="store_true",
+        help="Perfecter policy: stricter media/encoding filtering plus quality scoring",
+    )
 
     output_mode = parser.add_argument_group("output mode (choose one)")
     output_mode.add_argument("-q", "--quiet", action="count", default=0, help="Reduce output volume one level")
@@ -874,6 +944,7 @@ def main():
             basic_mode = args.search_groups
             if not basic_mode and not _has_scipy():
                 basic_mode = True
+            candidate_policy = _resolve_candidate_policy_from_flags(args)
             
             asyncio.run(
                 run_group_search_workflow(
@@ -885,6 +956,7 @@ def main():
                     debug=debug,
                     basic=basic_mode,
                     no_discogs=args.no_discogs,
+                    candidate_policy=candidate_policy,
                     output_dir=output_dir,
                 )
             )

@@ -184,6 +184,10 @@ def _editions_match(key1: Tuple, key2: Tuple) -> bool:
 def _parse_torrent(torrent: Dict[str, Any]) -> TorrentInfo:
     """Extract torrent info from browse torrent entry."""
     year = torrent.get("remasterYear")
+    trumpable_reasons = _parse_reason_list(
+        torrent.get("trumpable_reasons"),
+        torrent.get("trumpableReasons"),
+    )
     return TorrentInfo(
         torrent_id=int(torrent.get("torrentId") or torrent.get("id") or 0),
         edition_id=torrent.get("editionId"),
@@ -195,6 +199,14 @@ def _parse_torrent(torrent: Dict[str, Any]) -> TorrentInfo:
         remaster_title=torrent.get("remasterTitle") or torrent.get("remastertitle") or "",
         remaster_label=torrent.get("remasterRecordLabel") or torrent.get("remasterrecordlabel") or "",
         remaster_catalog=torrent.get("remasterCatalogueNumber") or torrent.get("remastercataloguenumber") or "",
+        has_log=_as_bool(torrent.get("hasLog")),
+        has_cue=_as_bool(torrent.get("hasCue")),
+        log_score=_as_int(torrent.get("logScore")),
+        log_checksum=_as_bool(torrent.get("logChecksum")),
+        trumpable=_as_bool(torrent.get("trumpable")),
+        trumpable_reasons=trumpable_reasons,
+        description=torrent.get("description"),
+        file_list=torrent.get("fileList"),
     )
 
 
@@ -205,6 +217,10 @@ def _parse_torrent_from_group(torrent: Dict[str, Any]) -> TorrentInfo:
     OPS torrentgroup does NOT include editionId (must use browse instead).
     """
     year = torrent.get("remasterYear")
+    trumpable_reasons = _parse_reason_list(
+        torrent.get("trumpable_reasons"),
+        torrent.get("trumpableReasons"),
+    )
     return TorrentInfo(
         torrent_id=int(torrent.get("id") or 0),
         edition_id=torrent.get("editionId"),  # RED has this, OPS doesn't
@@ -216,4 +232,42 @@ def _parse_torrent_from_group(torrent: Dict[str, Any]) -> TorrentInfo:
         remaster_title=torrent.get("remasterTitle") or "",
         remaster_label=torrent.get("remasterRecordLabel") or "",
         remaster_catalog=torrent.get("remasterCatalogueNumber") or "",
+        has_log=_as_bool(torrent.get("hasLog")),
+        has_cue=_as_bool(torrent.get("hasCue")),
+        log_score=_as_int(torrent.get("logScore")),
+        log_checksum=_as_bool(torrent.get("logChecksum")),
+        trumpable=_as_bool(torrent.get("trumpable")),
+        trumpable_reasons=trumpable_reasons,
+        description=torrent.get("description"),
+        file_list=torrent.get("fileList"),
     )
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_reason_list(*values: Any) -> List[str]:
+    for value in values:
+        if isinstance(value, list):
+            return [str(item) for item in value if isinstance(item, (str, int, float, bool))]
+    return []
