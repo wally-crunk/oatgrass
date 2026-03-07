@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -37,10 +38,19 @@ from oatgrass.search.resilience import (
     run_with_retries,
 )
 from oatgrass.search.tier_search_service import search_with_tiers
+from oatgrass.search.candidate_policy import (
+    CandidatePolicy,
+    PolicySummary,
+)
+from oatgrass.search.policy_candidate_resolution import (
+    build_no_match_candidates_from_entry,
+    resolve_policy_candidates,
+)
 from oatgrass import logger
 
 SEARCH_ENTRY_MAX_ATTEMPTS = 3
 COLLAGE_FETCH_MAX_ATTEMPTS = 3
+_ALNUM_RE = re.compile(r"[a-z0-9]", re.IGNORECASE)
 
 
 async def _search_entry_with_retries(
@@ -107,6 +117,32 @@ def _next_run_path(output_dir: Path = Path(".")) -> Path:
         except (ValueError, IndexError):
             pass
     return output_dir / f"run{max_num + 1}.txt"
+
+
+def _has_alnum_text(value: str | None) -> bool:
+    return bool(_ALNUM_RE.search((value or "").strip()))
+
+
+def _is_placeholder_only_search_context(search_context: SearchContext) -> bool:
+    return not _has_alnum_text(search_context.artist) and not _has_alnum_text(search_context.album)
+
+
+async def _evaluate_no_match_policy_candidates(
+    entry: dict,
+    *,
+    source_tracker: TrackerConfig,
+    source_client: GazelleServiceAdapter,
+    policy: CandidatePolicy,
+    enrichment_cache: dict[int, dict] | None = None,
+) -> tuple[list[tuple[str, int]], list[str], PolicySummary]:
+    candidates = build_no_match_candidates_from_entry(entry)
+    return await resolve_policy_candidates(
+        candidates,
+        source_tracker=source_tracker,
+        source_client=source_client,
+        policy=policy,
+        enrichment_cache=enrichment_cache,
+    )
 
 
 def _pick_opposite_tracker(trackers: dict[str, TrackerConfig], source_key: str) -> tuple[str, TrackerConfig]:
@@ -219,6 +255,8 @@ async def _load_entries_for_target(
 def _emit_final_candidates(
     entries: list[dict],
     cross_upload_candidates: list[tuple[str, int]],
+    policy_summary: PolicySummary | None = None,
+    placeholder_skipped: int = 0,
 ) -> None:
     if not cross_upload_candidates and not entries:
         return
@@ -247,6 +285,19 @@ def _emit_final_candidates(
     elif entries:
         _emit("No cross-upload candidates found.", indent=3)
 
+    if policy_summary is not None:
+        _emit("Policy summary:", indent=3)
+        _emit(f"Promoted: {policy_summary.promoted}", indent=6)
+        _emit(f"Demoted: {policy_summary.demoted}", indent=6)
+        _emit(f"Excluded by policy: {policy_summary.excluded_by_policy}", indent=6)
+        _emit(f"Dropped duplicate 24-bit Vinyl: {policy_summary.duplicate_24bit}", indent=6)
+        _emit(f"Suppressed total: {policy_summary.suppressed_total}", indent=6)
+    if placeholder_skipped > 0:
+        _emit(
+            f"Skipped {placeholder_skipped} item(s): source artist/album metadata is non-alphanumeric, can't search.",
+            indent=3,
+        )
+
 
 async def run_group_search_workflow(
     config: OatgrassConfig,
@@ -259,6 +310,7 @@ async def run_group_search_workflow(
     debug: bool = False,
     basic: bool = False,
     no_discogs: bool = False,
+    candidate_policy: CandidatePolicy = CandidatePolicy.STANDARD,
     output_dir: Path | None = None,
 ) -> None:
     log_path: Path | None = None
@@ -307,6 +359,12 @@ async def run_group_search_workflow(
         _emit(f"Source input: {source_label}")
         _emit(f"Source tracker: {source_tracker.name}")
         _emit(f"Opposite tracker: {opposite_tracker.name}")
+        if candidate_policy != CandidatePolicy.STANDARD:
+            total_source_torrents = sum(
+                len(item.get("torrents") or []) for item in entries if isinstance(item, dict)
+            )
+            _emit(f"Candidate policy: {candidate_policy.value}")
+            _emit(f"Policy rules: evaluating {total_source_torrents} source torrent(s) at startup.")
         if collage_url:
             _emit(f"Collage entries to process: {total}")
         else:
@@ -329,6 +387,9 @@ async def run_group_search_workflow(
                 _emit(f"[yellow]Warning: Discogs initialization failed: {e}. Tier 5 search will be skipped.[/yellow]")
 
         cross_upload_candidates = []
+        policy_summary = PolicySummary()
+        enrichment_cache: dict[int, dict] = {}
+        placeholder_skipped = 0
         show_task_context = (verbose or debug) and not abbrev
         started_at = time.monotonic()
 
@@ -360,73 +421,90 @@ async def run_group_search_workflow(
             hit = None
             used_tier = 1
             try:
-                if strict and not abbrev:
-                    _emit(
-                        f"Tier 1 search: artist='{search_context.artist}', album='{search_context.album}', year={search_context.year}",
-                        indent=3,
-                    )
-
-                result = await _search_entry_with_retries(
-                    gazelle_client,
-                    source_tracker_name=source_tracker.name.upper(),
-                    source_group_label=source_group_label,
-                    artist=search_context.artist,
-                    album=search_context.album,
-                    year=search_context.year,
-                    release_type=search_context.release_type,
-                    media=search_context.media,
-                    max_tier=1 if strict else 4,
-                )
-                if result:
-                    hit = result
-                    used_tier = 1
-
-                if not hit and not strict and discogs_service and search_context.artist and search_context.album:
+                if _is_placeholder_only_search_context(search_context):
+                    placeholder_skipped += 1
                     if not abbrev:
-                        _emit("Tier 5 Discogs search: querying artist variations", indent=3)
-
-                    cache_key = f"{search_context.artist}|{search_context.album}"
-                    if cache_key not in discogs_cache:
-                        try:
-                            artist_variations = await discogs_service.get_artist_variations(
-                                search_context.artist,
-                                search_context.album,
-                                search_context.year
-                            )
-                            discogs_cache[cache_key] = artist_variations
-                        except Exception:
-                            discogs_cache[cache_key] = []
-                    for artist_variant in discogs_cache.get(cache_key, []):
-                        if not abbrev:
-                            _emit(f"Tier 5 tracker search: artist='{artist_variant}', album='{search_context.album}'", indent=3)
-                        result = await _search_entry_with_retries(
-                            gazelle_client,
-                            source_tracker_name=source_tracker.name.upper(),
-                            source_group_label=source_group_label,
-                            artist=artist_variant,
-                            album=search_context.album,
-                            year=search_context.year,
-                            release_type=None,
-                            media=None,
-                            max_tier=4,
+                        _emit(
+                            "[yellow]Skipping target search: source artist/album metadata is placeholder-only.[/yellow]",
+                            indent=3,
                         )
-                        if result:
-                            hit = result
-                            used_tier = 5
+                else:
+                    if strict and not abbrev:
+                        _emit(
+                            f"Tier 1 search: artist='{search_context.artist}', album='{search_context.album}', year={search_context.year}",
+                            indent=3,
+                        )
+
+                    result = await _search_entry_with_retries(
+                        gazelle_client,
+                        source_tracker_name=source_tracker.name.upper(),
+                        source_group_label=source_group_label,
+                        artist=search_context.artist,
+                        album=search_context.album,
+                        year=search_context.year,
+                        release_type=search_context.release_type,
+                        media=search_context.media,
+                        max_tier=1 if strict else 4,
+                    )
+                    if result:
+                        hit = result
+                        used_tier = 1
+
+                    if not hit and not strict and discogs_service and search_context.artist and search_context.album:
+                        if not abbrev:
+                            _emit("Tier 5 Discogs search: querying artist variations", indent=3)
+
+                        cache_key = f"{search_context.artist}|{search_context.album}"
+                        if cache_key not in discogs_cache:
+                            try:
+                                artist_variations = await discogs_service.get_artist_variations(
+                                    search_context.artist,
+                                    search_context.album,
+                                    search_context.year
+                                )
+                                discogs_cache[cache_key] = artist_variations
+                            except Exception:
+                                discogs_cache[cache_key] = []
+                        for artist_variant in discogs_cache.get(cache_key, []):
                             if not abbrev:
-                                _emit(f"[green]Tier 5 match found[/green]", indent=3)
-                            break
-                        await asyncio.sleep(0.5)
+                                _emit(f"Tier 5 tracker search: artist='{artist_variant}', album='{search_context.album}'", indent=3)
+                            result = await _search_entry_with_retries(
+                                gazelle_client,
+                                source_tracker_name=source_tracker.name.upper(),
+                                source_group_label=source_group_label,
+                                artist=artist_variant,
+                                album=search_context.album,
+                                year=search_context.year,
+                                release_type=None,
+                                media=None,
+                                max_tier=4,
+                            )
+                            if result:
+                                hit = result
+                                used_tier = 5
+                                if not abbrev:
+                                    _emit("[green]Tier 5 match found[/green]", indent=3)
+                                break
+                            await asyncio.sleep(0.5)
 
                 collage_max = _collage_max_size(entry)
                 if not basic and hit and source_gid:
                     from oatgrass.search.edition_aware_mode import process_entry_edition_aware
                     try:
-                        _target_gid, edition_candidates = await process_entry_edition_aware(
+                        _target_gid, edition_candidates, suppression_messages, entry_summary = await process_entry_edition_aware(
                             entry, source_tracker, opposite_tracker,
                             source_client, gazelle_client,
-                            _emit, abbrev, verbose, show_context_line=show_task_context
+                            _emit,
+                            abbrev,
+                            verbose,
+                            candidate_policy=candidate_policy,
+                            show_context_line=show_task_context,
+                            enrichment_cache=enrichment_cache,
                         )
+                        policy_summary.merge(entry_summary)
+                        if not abbrev:
+                            for message in suppression_messages:
+                                _emit(message, indent=3)
                         if edition_candidates:
                             cross_upload_candidates.extend(edition_candidates)
                         if idx < total:
@@ -437,6 +515,35 @@ async def run_group_search_workflow(
                             _emit(f"[yellow]Edition-aware processing failed: {e}. Falling back to basic mode.[/yellow]", indent=3)
 
                 if not hit:
+                    if candidate_policy != CandidatePolicy.STANDARD and source_gid is not None and source_client is not None:
+                        no_match_candidates, suppression_messages, entry_summary = await _evaluate_no_match_policy_candidates(
+                            entry,
+                            source_tracker=source_tracker,
+                            source_client=source_client,
+                            policy=candidate_policy,
+                            enrichment_cache=enrichment_cache,
+                        )
+                        policy_summary.merge(entry_summary)
+                        if not abbrev:
+                            _emit_task_context(None)
+                            _emit(
+                                "[yellow]No matching group found on the opposite tracker.[/yellow]",
+                                indent=3,
+                            )
+                            for message in suppression_messages:
+                                _emit(message, indent=3)
+                            if no_match_candidates:
+                                _emit(
+                                    f"[yellow]No matching group found. {len(no_match_candidates)} policy-eligible upload candidate(s).[/yellow]",
+                                    indent=3,
+                                )
+                            else:
+                                _emit("[cyan]No matching group found. No policy-eligible upload candidates.[/cyan]", indent=3)
+                        cross_upload_candidates.extend(no_match_candidates)
+                        if idx < total:
+                            await asyncio.sleep(0.005)
+                        continue
+
                     if abbrev:
                         if source_gid is not None:
                             suggestion = _cross_upload_url(source_tracker, source_gid)
@@ -509,7 +616,12 @@ async def run_group_search_workflow(
             if idx < total:
                 await asyncio.sleep(0.005)
 
-        _emit_final_candidates(entries, cross_upload_candidates)
+        _emit_final_candidates(
+            entries,
+            cross_upload_candidates,
+            policy_summary if candidate_policy != CandidatePolicy.STANDARD else None,
+            placeholder_skipped=placeholder_skipped,
+        )
     finally:
         if source_client is not None:
             await source_client.close()
