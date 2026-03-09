@@ -179,6 +179,20 @@ async def _find_source_browse_result(
     return results[0] if results else None
 
 
+def _source_torrent_has_edition_id(source_torrent: dict) -> bool:
+    value = (
+        source_torrent.get("editionId")
+        or source_torrent.get("edition_id")
+        or source_torrent.get("editionID")
+    )
+    if value in (None, ""):
+        return False
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return True
+
+
 async def _evaluate_profile_entry(
     entry: ProfileTorrent,
     source_tracker: TrackerConfig,
@@ -254,18 +268,19 @@ async def _evaluate_profile_entry(
     search_artist = group_artist or (entry.artist_name or group_name)
 
     source_browse_result = None
-    if entry.group_id is not None and lookup_cache is not None and entry.group_id in lookup_cache.source_browse_results:
-        source_browse_result = lookup_cache.source_browse_results[entry.group_id]
-    else:
-        source_browse_result = await _find_source_browse_result(
-            source_client,
-            artist=search_artist,
-            album=group_name,
-            year=group_year,
-            group_id=entry.group_id,
-        )
-        if entry.group_id is not None and lookup_cache is not None:
-            lookup_cache.source_browse_results[entry.group_id] = source_browse_result
+    if not _source_torrent_has_edition_id(source_torrent):
+        if entry.group_id is not None and lookup_cache is not None and entry.group_id in lookup_cache.source_browse_results:
+            source_browse_result = lookup_cache.source_browse_results[entry.group_id]
+        else:
+            source_browse_result = await _find_source_browse_result(
+                source_client,
+                artist=search_artist,
+                album=group_name,
+                year=group_year,
+                group_id=entry.group_id,
+            )
+            if entry.group_id is not None and lookup_cache is not None:
+                lookup_cache.source_browse_results[entry.group_id] = source_browse_result
 
     source_group = parse_group_hybrid(
         group_data, [source_torrent], source_browse_result, source_tracker.name.upper()
