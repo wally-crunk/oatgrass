@@ -427,6 +427,10 @@ async def run_profile_search_workflow(
 
     log_path = _next_run_path(output_dir or Path("output"))
     logger.set_logger(logger.OatgrassLogger(log_path))
+    from oatgrass.rate_limits import describe_slow_mode
+
+    if slow_mode_note := describe_slow_mode():
+        logger.info(slow_mode_note)
     logger.info("[Profile Search] Cached list mode")
     logger.info(f"Source tracker: {source_tracker.name.upper()}")
     logger.info(f"Target tracker: {opposite_tracker.name.upper()}")

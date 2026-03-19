@@ -19,6 +19,7 @@ class OatgrassLogger:
         self._start_time = datetime.now()
         self.debug_mode = debug
         self._rate_limit_note_trackers: set[str] = set()
+        self._throttle_note_trackers: set[str] = set()
         self._status_active = False
         self._status_len = 0
         
@@ -132,7 +133,19 @@ class OatgrassLogger:
     
     def api_retry(self, tracker: str, attempt: int, max_attempts: int, delay: int):
         """Log API retry"""
-        self.log(f"{tracker} server timeout. Retrying in {delay}s... (attempt {attempt}/{max_attempts})", "[WARNING] ")
+        self.log(f"{tracker} request retry in {delay}s... (attempt {attempt}/{max_attempts})", "[WARNING] ")
+
+    def api_throttle(self, tracker: str) -> None:
+        """Log one-time tracker/service throttle warning."""
+        tracker_key = tracker.upper()
+        if tracker_key in self._throttle_note_trackers:
+            return
+        self._throttle_note_trackers.add(tracker_key)
+        self.log(
+            f"API throttling response from {tracker_key} (429). Are you running multiple oatgrass scripts? "
+            "Consider --slow or a higher --slow value.",
+            "[WARNING] ",
+        )
     
     def api_failed(self, tracker: str, max_attempts: int):
         """Log API failure"""

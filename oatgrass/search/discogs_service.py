@@ -1,5 +1,7 @@
 """Minimal Discogs service for artist name variation lookups."""
 
+from __future__ import annotations
+
 import asyncio
 import difflib
 import time
@@ -9,9 +11,12 @@ from typing import Optional
 import aiohttp
 
 from oatgrass.__version__ import __version__
+from oatgrass import logger
 from oatgrass.rate_limits import (
     DISCOGS_MAX_CONCURRENT_REQUESTS,
     DISCOGS_MIN_INTERVAL_SECONDS,
+    compute_throttle_retry_delay,
+    get_effective_interval,
 )
 
 
@@ -31,26 +36,33 @@ class DiscogsService:
     
     async def _make_request(self, endpoint: str) -> dict:
         """Make rate-limited request to Discogs API."""
-        async with self.rate_limit:
-            now = time.time()
-            if now - self.last_request < DISCOGS_MIN_INTERVAL_SECONDS:
-                await asyncio.sleep(DISCOGS_MIN_INTERVAL_SECONDS - (now - self.last_request))
-            
-            self.last_request = time.time()
-            
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    f"{self.base_url}{endpoint}",
-                    headers=self.headers
-                ) as response:
-                    if response.status == 429:
-                        retry_after = int(response.headers.get("Retry-After", 60))
-                        await asyncio.sleep(retry_after)
-                        return await self._make_request(endpoint)
-                    
-                    response.raise_for_status()
-                    return await response.json()
+        timeout = aiohttp.ClientTimeout(total=30)
+        while True:
+            async with self.rate_limit:
+                now = time.time()
+                min_interval = get_effective_interval(DISCOGS_MIN_INTERVAL_SECONDS)
+                if now - self.last_request < min_interval:
+                    await asyncio.sleep(min_interval - (now - self.last_request))
+
+                self.last_request = time.time()
+
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        f"{self.base_url}{endpoint}",
+                        headers=self.headers
+                    ) as response:
+                        if response.status == 429:
+                            logger.get_logger().api_throttle("DISCOGS")
+                            delay = compute_throttle_retry_delay(
+                                retry_after=response.headers.get("Retry-After"),
+                                effective_min_interval=min_interval,
+                                fallback_delay=60.0,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+
+                        response.raise_for_status()
+                        return await response.json()
     
     async def get_artist_variations(
         self,

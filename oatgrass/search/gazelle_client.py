@@ -12,7 +12,9 @@ from oatgrass.config import TrackerConfig
 from oatgrass.rate_limits import (
     GAZELLE_MIN_INTERVAL_SECONDS,
     GAZELLE_WAIT_LOG_THRESHOLD_SECONDS,
+    compute_throttle_retry_delay,
     enforce_gazelle_min_interval,
+    get_effective_interval,
 )
 from oatgrass.search.protocols import GazelleClient
 from oatgrass.search.types import GazelleSearchResult
@@ -146,7 +148,13 @@ class GazelleServiceAdapter(GazelleClient):
                             )
                             # Retry only transient server failures and explicit throttling.
                             if attempt < max_retries - 1 and response.status in {429, 500, 502, 503, 504}:
-                                delay = self._retry_delay_seconds(attempt=attempt, retry_after=response.headers.get("Retry-After"))
+                                delay = self._retry_delay_seconds(
+                                    attempt=attempt,
+                                    status=response.status,
+                                    retry_after=response.headers.get("Retry-After"),
+                                )
+                                if response.status == 429:
+                                    logger.get_logger().api_throttle(self.tracker.name.upper())
                                 logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
                                 await asyncio.sleep(delay)
                                 continue
@@ -163,16 +171,16 @@ class GazelleServiceAdapter(GazelleClient):
                         logger.get_logger().api_failed(self.tracker.name.upper(), max_retries)
                         raise
 
-    @staticmethod
-    def _retry_delay_seconds(*, attempt: int, retry_after: str | None) -> int:
-        if retry_after:
-            try:
-                value = int(float(retry_after))
-            except (TypeError, ValueError):
-                value = 0
-            if value > 0:
-                return value
-        return 2 ** (attempt + 1)
+    def _retry_delay_seconds(self, *, attempt: int, status: int, retry_after: str | None) -> int:
+        fallback_delay = 2 ** (attempt + 1)
+        if status == 429:
+            delay = compute_throttle_retry_delay(
+                retry_after=retry_after,
+                effective_min_interval=get_effective_interval(self._min_interval_seconds),
+                fallback_delay=fallback_delay,
+            )
+            return int(delay) if delay.is_integer() else int(delay) + 1
+        return fallback_delay
 
     async def _enforce_interval(self) -> None:
         wait = await enforce_gazelle_min_interval(

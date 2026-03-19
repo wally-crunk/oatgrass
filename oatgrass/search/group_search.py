@@ -332,6 +332,10 @@ async def run_group_search_workflow(
     discogs_cache: dict[str, list[str]] = {}
 
     try:
+        from oatgrass.rate_limits import describe_slow_mode
+
+        if slow_mode_note := describe_slow_mode():
+            logger.info(slow_mode_note)
         try:
             entries, collage_url, source_tracker, opposite_tracker = await _load_entries_for_target(
                 config,

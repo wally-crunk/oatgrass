@@ -17,6 +17,7 @@ GAZELLE_RATE_LIMIT_WINDOW_SECONDS = 10.0
 # Discogs API: conservative spacing used by existing ANV lookup flow.
 DISCOGS_MIN_INTERVAL_SECONDS = 2.4
 DISCOGS_MAX_CONCURRENT_REQUESTS = 25
+SLOW_MODE_SAFETY_MARGIN = 0.05
 
 
 @dataclass
@@ -28,6 +29,66 @@ class _GazelleBucket:
 
 _gazelle_buckets: dict[str, _GazelleBucket] = {}
 _gazelle_buckets_lock = asyncio.Lock()
+_slow_mode_concurrent_runs: int | None = None
+
+
+def set_slow_mode_concurrent_runs(concurrent_runs: int | None) -> None:
+    """Set the process-wide slow-mode target run count."""
+    global _slow_mode_concurrent_runs
+    if concurrent_runs is None:
+        _slow_mode_concurrent_runs = None
+        return
+    if int(concurrent_runs) < 2:
+        raise ValueError("slow mode requires at least 2 concurrent runs")
+    _slow_mode_concurrent_runs = int(concurrent_runs)
+
+
+def get_slow_mode_concurrent_runs() -> int | None:
+    """Return the active slow-mode target run count."""
+    return _slow_mode_concurrent_runs
+
+
+def get_slow_mode_multiplier() -> float:
+    """Return the active base pacing multiplier."""
+    concurrent_runs = get_slow_mode_concurrent_runs()
+    if concurrent_runs is None:
+        return 1.0
+    return float(concurrent_runs) + SLOW_MODE_SAFETY_MARGIN
+
+
+def get_effective_interval(base_interval_seconds: float) -> float:
+    """Return the active pacing interval for a base interval."""
+    return max(0.0, float(base_interval_seconds)) * get_slow_mode_multiplier()
+
+
+def compute_throttle_retry_delay(
+    *,
+    retry_after: str | None,
+    effective_min_interval: float,
+    fallback_delay: float,
+) -> float:
+    """Choose a conservative 429 retry delay."""
+    try:
+        retry_after_seconds = float(retry_after) if retry_after else 0.0
+    except (TypeError, ValueError):
+        retry_after_seconds = 0.0
+    floor = max(0.0, float(effective_min_interval))
+    if retry_after_seconds > 0:
+        return max(retry_after_seconds + 1.0, floor)
+    return max(max(0.0, float(fallback_delay)), floor)
+
+
+def describe_slow_mode() -> str | None:
+    """Return a user-facing description of active slow mode."""
+    concurrent_runs = get_slow_mode_concurrent_runs()
+    if concurrent_runs is None:
+        return None
+    multiplier = get_slow_mode_multiplier()
+    multiplier_text = str(int(multiplier)) if multiplier.is_integer() else f"{multiplier:.2f}"
+    return (
+        f"Slow mode active: pacing for {concurrent_runs} concurrent runs "
+        f"(x{multiplier_text} interval multiplier)."
+    )
 
 
 def _normalize_server_key(base_url: str) -> str:
@@ -76,7 +137,7 @@ async def enforce_gazelle_min_interval(
     window_seconds = GAZELLE_RATE_LIMIT_WINDOW_SECONDS if request_limit else 0.0
     async with bucket.lock:
         now = time.monotonic()
-        effective_min_interval = max(0.0, float(min_interval_seconds))
+        effective_min_interval = get_effective_interval(min_interval_seconds)
         min_wait = effective_min_interval - (now - bucket.last_request_started)
         _prune_window(bucket, now, window_seconds)
         window_wait = 0.0
@@ -96,3 +157,4 @@ async def enforce_gazelle_min_interval(
 def _reset_gazelle_rate_limits_for_tests() -> None:
     """Test helper to clear shared limiter state."""
     _gazelle_buckets.clear()
+    set_slow_mode_concurrent_runs(None)

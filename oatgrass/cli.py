@@ -19,7 +19,12 @@ try:
     import oatgrass as pkg
     from .config import OatgrassConfig, TrackerConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
-    from .rate_limits import GAZELLE_MIN_INTERVAL_SECONDS
+    from .rate_limits import (
+        describe_slow_mode,
+        GAZELLE_MIN_INTERVAL_SECONDS,
+        get_effective_interval,
+        set_slow_mode_concurrent_runs,
+    )
     from .profile.menu_service import ProfileMenuService, build_profile_summary, render_profile_summaries
     from .profile.retriever import (
         ListType,
@@ -39,10 +44,10 @@ except ImportError as e:
 
 console = Console()
 PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW = 3
-PROFILE_SEARCH_BEST_CASE_API_DELAY_SECONDS = GAZELLE_MIN_INTERVAL_SECONDS
 _CLI_SESSION_START_MONOTONIC = time.monotonic()
 _SCIPY_AVAILABLE: bool | None = None
 _SCIPY_STARTUP_WARNING_EMITTED = False
+_SLOW_MODE_INFO_EMITTED = False
 MAIN_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "Search for Cross-Upload Candidates",
@@ -81,6 +86,16 @@ def _ui_warn(message: str) -> None:
 
 def _ui_error(message: str) -> None:
     console.print(f"[red][ERROR][/red] {message}")
+
+
+def _emit_slow_mode_info_once() -> None:
+    global _SLOW_MODE_INFO_EMITTED
+    if _SLOW_MODE_INFO_EMITTED:
+        return
+    if (description := describe_slow_mode()) is None:
+        return
+    _ui_info(description)
+    _SLOW_MODE_INFO_EMITTED = True
 
 
 def _ui_prompt(label: str, default: str | None = None) -> str:
@@ -221,6 +236,7 @@ def _render_main_menu(config: OatgrassConfig) -> None:
 
     console.print(Panel("[bold blue]OATGRASS - Feed the gazelles[/bold blue]\nFind candidates for cross-uploading"))
     console.print()
+    _emit_slow_mode_info_once()
     display_config_table(config)
     for section_idx, (section_title, items) in enumerate(MAIN_MENU_SECTIONS):
         console.print(section_title)
@@ -780,7 +796,7 @@ def _show_profile_search_estimate(
     _show_duration_estimate(
         entry_count=entry_count,
         per_row_calls=per_row_calls,
-        per_call_seconds=PROFILE_SEARCH_BEST_CASE_API_DELAY_SECONDS,
+        per_call_seconds=get_effective_interval(GAZELLE_MIN_INTERVAL_SECONDS),
     )
 
 
@@ -851,11 +867,12 @@ def _emit_deprecated_output_flag_warnings(args: argparse.Namespace) -> None:
 
 def main():
     """Entry point"""
+    global _SLOW_MODE_INFO_EMITTED
     _reset_cli_session_timer()
     parser = argparse.ArgumentParser(
         prog="oatgrass",
         usage=(
-            "oatgrass [-h] [--verify] [-c PATH] [-o DIR] "
+            "oatgrass [-h] [--verify] [-c PATH] [-o DIR] [--slow [N]] "
             "[--version] "
             "[--search-editions|--search-groups] [--no-discogs] [--no-fallback] [--perfect|--perfecter] "
             "[--debug | -q | -qq | --quieter | -a | -n | -v] [url_or_id]"
@@ -869,6 +886,14 @@ def main():
     general.add_argument("--verify", action="store_true", help="Verify keys and exit")
     general.add_argument("-c", "--config", metavar="PATH", help="Path to config.toml (file or directory)")
     general.add_argument("-o", "--output", metavar="DIR", help="Output directory for run logs (default: ./output)")
+    general.add_argument(
+        "--slow",
+        nargs="?",
+        type=int,
+        const=2,
+        metavar="N",
+        help="Slow API pacing for N concurrent oatgrass runs (bare --slow implies N=2)",
+    )
 
     search_behavior = parser.add_argument_group("search behavior")
     search_behavior.add_argument("--search-editions", action="store_true", help="Search at edition level (default)")
@@ -898,6 +923,8 @@ def main():
     parser.add_argument('url_or_id', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
+        _SLOW_MODE_INFO_EMITTED = False
+        set_slow_mode_concurrent_runs(None)
         args = parser.parse_args()
         if args.help:
             show_help(parser)
@@ -905,6 +932,10 @@ def main():
         if args.version:
             print(_help_header())
             sys.exit(0)
+        if args.slow is not None and args.slow < 2:
+            _ui_error("--slow requires an integer >= 2")
+            sys.exit(1)
+        set_slow_mode_concurrent_runs(args.slow)
 
         def resolve_config_path(args_config: Optional[str]) -> Path:
             if args_config:
@@ -963,6 +994,7 @@ def main():
             sys.exit(0)
 
         if args.verify:
+            _emit_slow_mode_info_once()
             _ui_info("Verifying API Keys...")
             result = asyncio.run(verify_api_keys(config))
             sys.exit(0 if result else 1)
