@@ -132,10 +132,10 @@ class GazelleServiceAdapter(GazelleClient):
         request_start = time.time()
 
         async with self._semaphore:
-            await self._enforce_interval()
             session = await self._ensure_session()
             for attempt in range(max_retries):
                 try:
+                    await self._enforce_interval()
                     async with session.get(url, params=params) as response:
                         if response.status >= 400:
                             text = await response.text()
