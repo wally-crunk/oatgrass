@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""
-cli.py - Entry point for OATGRASS - Verify API Keys
-"Tracker API, Officially Confirm Access"
-"""
+"""Entry point for Oatgrass -- feed the gazelles."""
+
+from __future__ import annotations
+
+import sys
+
+# Dependency-free (stdlib only), so safe to import ahead of the risky
+# block below -- lets the version print even if a required package is missing.
+from oatgrass.__version__ import __version__
 
 try:
     import asyncio
-    import sys
     import argparse
     import json
     import time
+    import traceback
     from dataclasses import asdict
+    from datetime import datetime
     from pathlib import Path
-    from rich.console import Console
     from rich.prompt import Prompt
     from rich.table import Table
     from typing import Literal, Optional, cast
-    import oatgrass as pkg
+    from oatgrass import logger
     from .config import OatgrassConfig, TrackerConfig, load_config
     from .api_verification import verify_api_keys, API_SERVICES
     from .rate_limits import (
-        describe_slow_mode,
+        describe_slow_mode_once,
         GAZELLE_MIN_INTERVAL_SECONDS,
         get_effective_interval,
         set_slow_mode_concurrent_runs,
@@ -40,14 +45,29 @@ try:
 except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install required dependencies: pip install -r requirements.txt")
+    print("Consider using venv and `source .venv/bin/activate`")
     sys.exit(1)
 
-console = Console()
+class _SharedConsoleProxy:
+    """Forwards attribute access to the current shared logger's Console
+    rather than holding a fixed instance of its own -- cli.py previously
+    kept its own separate Console() for menu/table rendering, meaning two
+    live Console objects existed at once (this one, and logger.py's shared
+    one) even after api_verification.py and formatters.py were routed onto
+    the shared one. logger.set_logger() can also swap the active logger
+    mid-session (when a search workflow starts), so caching a single
+    Console reference here would go stale; this always resolves fresh.
+    """
+
+    def __getattr__(self, name):
+        return getattr(logger.get_logger().console, name)
+
+
+console = _SharedConsoleProxy()
 PROFILE_SEARCH_BEST_CASE_CALLS_PER_ROW = 3
 _CLI_SESSION_START_MONOTONIC = time.monotonic()
 _SCIPY_AVAILABLE: bool | None = None
 _SCIPY_STARTUP_WARNING_EMITTED = False
-_SLOW_MODE_INFO_EMITTED = False
 MAIN_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "Search for Cross-Upload Candidates",
@@ -77,25 +97,48 @@ MAIN_MENU_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 )
 
 def _ui_info(message: str) -> None:
-    console.print(f"[cyan][INFO][/cyan] {message}")
+    logger.log(message, "[INFO] ")
 
 
 def _ui_warn(message: str) -> None:
-    console.print(f"[yellow][WARNING][/yellow] {message}")
+    logger.warning(message)
 
 
 def _ui_error(message: str) -> None:
-    console.print(f"[red][ERROR][/red] {message}")
+    logger.error(message)
+
+
+# Shared with group_search.py's edition-processing-failure catch, which needs
+# the same "expected failure vs. likely bug" distinction.
+_is_internal_defect = logger.is_internal_defect
+
+
+def _write_crash_report() -> Path | None:
+    """Best-effort durable copy of the current exception's full traceback.
+
+    Must be called from inside an except block. A search workflow's own
+    finally block already closes its OatgrassLogger (and thus its run log
+    file) before an uncaught exception reaches this top-level handler, so
+    that file is not available to append to by the time we get here -- this
+    writes a small standalone file instead, so the traceback survives past
+    the terminal scrollback the screen message points at.
+    """
+    try:
+        output_dir = Path("output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        crash_path = output_dir / f"crash-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+        crash_path.write_text(traceback.format_exc(), encoding="utf-8")
+        return crash_path
+    except OSError:
+        return None
 
 
 def _emit_slow_mode_info_once() -> None:
-    global _SLOW_MODE_INFO_EMITTED
-    if _SLOW_MODE_INFO_EMITTED:
-        return
-    if (description := describe_slow_mode()) is None:
-        return
-    _ui_info(description)
-    _SLOW_MODE_INFO_EMITTED = True
+    # Delegates to rate_limits' shared once-flag so the interactive menu and
+    # whichever search workflow runs afterward don't each print their own
+    # copy of the same session-level notice.
+    if (description := describe_slow_mode_once()) is not None:
+        _ui_info(description)
 
 
 def _ui_prompt(label: str, default: str | None = None) -> str:
@@ -128,6 +171,7 @@ def _ui_prompt_yesno(
         return False
     if allow_cancel and first in {"c", "x"}:
         return False
+    _ui_warn(f"'{choice}' not recognized; using default ({'yes' if default_yes else 'no'}).")
     return default_yes
 
 
@@ -681,18 +725,14 @@ def _run_group_search_prompt(config: OatgrassConfig) -> None:
         "Output mode",
         "Output mode",
         [
-            ("A", "Abbreviated - One line per group"),
-            ("Q", "Quiet - Album matching + brief candidate summary"),
-            ("V", "Verbose (default) - Full edition details, confidence scores"),
+            ("N", "Normal (default) - Full edition details, confidence scores"),
+            ("C", "Compact - One line per group"),
             ("D", "Debug - API calls, JSON responses, timestamps"),
         ],
-        default="V",
+        default="N",
     )
-    abbrev = output_choice == "A"
-    verbose = output_choice == "V"
+    abbrev = output_choice == "C"
     debug = output_choice == "D"
-    if output_choice == "N":
-        verbose = False
 
     policy_choice = _prompt_menu_choice(
         "Candidate policy",
@@ -743,7 +783,6 @@ def _run_group_search_prompt(config: OatgrassConfig) -> None:
         tracker_key=tracker_key,
         strict=no_fallback,
         abbrev=abbrev,
-        verbose=verbose,
         debug=debug,
         basic=basic,
         no_discogs=no_discogs,
@@ -826,7 +865,7 @@ def _format_seconds_value(seconds: float) -> str:
 
 
 def _help_header() -> str:
-    return f"OATGRASS v{getattr(pkg, '__version__', '0.0.0')} - Find candidates for cross-uploading"
+    return f"OATGRASS v{__version__} - Find candidates for cross-uploading"
 
 
 def show_help(parser: argparse.ArgumentParser) -> None:
@@ -835,39 +874,31 @@ def show_help(parser: argparse.ArgumentParser) -> None:
     parser.print_help()
 
 
-def _resolve_cli_output_modes(args: argparse.Namespace) -> tuple[bool, bool, bool]:
-    quiet_count = int(getattr(args, "quiet", 0) or 0)
+def _resolve_cli_output_modes(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Resolve output flags to (abbrev, debug).
+
+    Oatgrass has three real output levels, one flag each: no flag = normal
+    (default, full per-entry detail), -q/--quiet = compact (one line per
+    entry), -d/--debug = debug. No synonyms, no legacy aliases -- the
+    previous four-level model (plus -qq/--quieter, -a/--abbrev, -n/--normal,
+    -v/--verbose as deprecated no-op aliases) has been fully removed.
+
+    There is no third "verbose" return value: normal output always shows
+    full per-entry detail, so "verbose" was never anything but a synonym for
+    "not abbrev" once the four-level model collapsed to three -- carrying it
+    as its own parameter through every downstream function was dead weight,
+    so it has been removed from the whole call chain, not just from here.
+    """
     debug = bool(getattr(args, "debug", False))
-    verbose_flag = bool(getattr(args, "verbose", False))
-    normal_flag = bool(getattr(args, "normal", False))
-    abbrev_flag = bool(getattr(args, "abbrev", False))
-    quiet_flag = bool(getattr(args, "quieter", False)) or quiet_count > 0
+    compact = bool(getattr(args, "quiet", False))
 
-    if sum(bool(x) for x in (debug, verbose_flag, normal_flag, abbrev_flag, quiet_flag)) > 1:
-        raise ValueError("Cannot combine output modes; choose one of --debug, --verbose, --normal, --abbrev, --quiet/--quieter")
-    if debug:
-        return False, False, True
-    if abbrev_flag or getattr(args, "quieter", False) or quiet_count >= 2:
-        return True, False, False
-    if normal_flag or quiet_count == 1:
-        return False, False, False
-    return False, True, False
-
-
-def _emit_deprecated_output_flag_warnings(args: argparse.Namespace) -> None:
-    deprecated_flags = (
-        ("--abbrev", bool(getattr(args, "abbrev", False))),
-        ("--normal", bool(getattr(args, "normal", False))),
-        ("--verbose", bool(getattr(args, "verbose", False))),
-    )
-    for flag, used in deprecated_flags:
-        if used:
-            _ui_warn(f"{flag}: That's a deprecated parameter, it will go away in the next release.")
+    if debug and compact:
+        raise ValueError("Cannot combine output modes; choose one of --debug or -q/--quiet")
+    return compact, debug
 
 
 def main():
     """Entry point"""
-    global _SLOW_MODE_INFO_EMITTED
     _reset_cli_session_timer()
     parser = argparse.ArgumentParser(
         prog="oatgrass",
@@ -875,7 +906,7 @@ def main():
             "oatgrass [-h] [--verify] [-c PATH] [-o DIR] [--slow [N]] "
             "[--version] "
             "[--search-editions|--search-groups] [--no-discogs] [--no-fallback] [--perfect|--perfecter] "
-            "[--debug | -q | -qq | --quieter | -a | -n | -v] [url_or_id]"
+            "[--debug | -q] [url_or_id]"
         ),
         add_help=False,
         formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=25),
@@ -911,19 +942,12 @@ def main():
         help="Perfecter policy: stricter media/encoding filtering plus quality scoring",
     )
 
-    output_mode = parser.add_argument_group("output mode (choose one)")
-    output_mode.add_argument("-q", "--quiet", action="count", default=0, help="Reduce output volume one level")
-    output_mode.add_argument("-qq", "--quieter", action="store_true", help="Reduce output volume two levels; minimal output")
-    output_mode.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
-
-    legacy = parser.add_argument_group("legacy output aliases (deprecated)")
-    legacy.add_argument("-a", "--abbrev", action="store_true", help="Legacy alias for -qq/--quieter")
-    legacy.add_argument("-n", "--normal", action="store_true", help="Legacy alias for -q/--quiet")
-    legacy.add_argument("-v", "--verbose", action="store_true", help="Legacy alias for default verbose output")
+    output_mode = parser.add_argument_group("output mode (choose one; default is normal)")
+    output_mode.add_argument("-q", "--quiet", action="store_true", help="Compact output: one line per entry")
+    output_mode.add_argument("-d", "--debug", action="store_true", help="Debug output: API calls, JSON responses, timestamps")
     parser.add_argument('url_or_id', nargs='?', help='Collage URL, group URL, or group ID')
 
     try:
-        _SLOW_MODE_INFO_EMITTED = False
         set_slow_mode_concurrent_runs(None)
         args = parser.parse_args()
         if args.help:
@@ -936,6 +960,7 @@ def main():
             _ui_error("--slow requires an integer >= 2")
             sys.exit(1)
         set_slow_mode_concurrent_runs(args.slow)
+        print(f"Welcome to Oatgrass {__version__}")
 
         def resolve_config_path(args_config: Optional[str]) -> Path:
             if args_config:
@@ -961,9 +986,8 @@ def main():
         _emit_scipy_startup_warning_once()
         
         if args.url_or_id:
-            _emit_deprecated_output_flag_warnings(args)
             try:
-                abbrev, verbose, debug = _resolve_cli_output_modes(args)
+                abbrev, debug = _resolve_cli_output_modes(args)
             except ValueError as exc:
                 _ui_error(str(exc))
                 sys.exit(1)
@@ -983,7 +1007,6 @@ def main():
                     args.url_or_id,
                     strict=args.no_fallback,
                     abbrev=abbrev,
-                    verbose=verbose,
                     debug=debug,
                     basic=basic_mode,
                     no_discogs=args.no_discogs,
@@ -995,7 +1018,8 @@ def main():
 
         if args.verify:
             _emit_slow_mode_info_once()
-            _ui_info("Verifying API Keys...")
+            # verify_api_keys() prints its own "Verifying API Keys..." banner;
+            # don't duplicate it here.
             result = asyncio.run(verify_api_keys(config))
             sys.exit(0 if result else 1)
         else:
@@ -1005,7 +1029,31 @@ def main():
         _ui_goodbye_with_elapsed()
         sys.exit(0)
     except Exception as e:
-        _ui_error(f"Fatal error: {e}")
+        if _is_internal_defect(e):
+            traceback.print_exc(file=sys.stderr)
+            # Also append to the current run's log file if one is still open
+            # (an exception raised outside a workflow's own try/finally, e.g.
+            # during menu navigation, may not have closed it yet); otherwise
+            # fall back to a standalone crash file, since the common case --
+            # a defect inside run_group_search_workflow -- already closed the
+            # run log via its own finally block before we got here.
+            file_handle = getattr(logger.get_logger(), "_file_handle", None)
+            if file_handle is not None:
+                try:
+                    file_handle.write(traceback.format_exc() + "\n")
+                    file_handle.flush()
+                except OSError:
+                    pass
+                crash_path = None
+            else:
+                crash_path = _write_crash_report()
+            location = f" Full traceback saved to {crash_path}." if crash_path else ""
+            _ui_error(
+                f"Unexpected internal error ({type(e).__name__}: {e}). "
+                "This looks like a bug, not a normal failure." + location
+            )
+        else:
+            _ui_error(f"Fatal error: {e}")
         sys.exit(1)
 
 

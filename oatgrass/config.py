@@ -1,19 +1,18 @@
-"""
-config.py - Simplified configuration model for Oatgrass
-"""
+"""Simplified configuration model for Oatgrass."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Optional
 from pydantic import BaseModel, Field
-from rich.console import Console
 import sys
+
+from oatgrass import logger
 
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
-
-console = Console()
 
 
 class APIKeysConfig(BaseModel):
@@ -53,8 +52,8 @@ def load_config(config_path: Path) -> OatgrassConfig:
     """Load configuration from TOML file"""
     
     if not config_path.exists():
-        console.print(f"[red][ERROR][/red] Configuration file not found: {config_path}")
-        console.print("Please create config.toml with your API keys")
+        logger.error(f"Configuration file not found: {config_path}")
+        logger.info("Please create config.toml with your API keys")
         sys.exit(1)
     
     try:
@@ -75,5 +74,5 @@ def load_config(config_path: Path) -> OatgrassConfig:
         return config
         
     except Exception as e:
-        console.print(f"[red][ERROR][/red] Error loading configuration: {e}")
+        logger.error(f"Error loading configuration: {e}")
         sys.exit(1)

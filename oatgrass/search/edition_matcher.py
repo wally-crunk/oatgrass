@@ -1,5 +1,7 @@
 """Match editions between source and target trackers (Stage 4)."""
 
+from __future__ import annotations
+
 import numpy as np
 from dataclasses import dataclass
 from difflib import SequenceMatcher

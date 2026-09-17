@@ -12,6 +12,7 @@ import aiohttp
 
 from oatgrass.__version__ import __version__
 from oatgrass import logger
+from oatgrass.progress_timing import build_task_timing_phrase
 from oatgrass.rate_limits import (
     DISCOGS_MAX_CONCURRENT_REQUESTS,
     DISCOGS_MIN_INTERVAL_SECONDS,
@@ -89,20 +90,36 @@ class DiscogsService:
         # Discogs ranks by character similarity, not semantic meaning.
         # Maalem/Maleem/Maâlem are the same honorific but treated as distinct strings.
         candidates = []
-        for search_result in result['results'][:3]:
-            artist_id = search_result['id']
-            artist_data = await self._make_request(f"/artists/{artist_id}")
-            
-            canonical = artist_data.get('name', '')
-            anvs = artist_data.get('namevariations', [])
-            
-            # Check if exact match in canonical or ANVs
-            if canonical.lower() == artist.lower() or any(anv.lower() == artist.lower() for anv in anvs):
-                ratio = 1.0
-            else:
-                ratio = difflib.SequenceMatcher(None, artist.lower(), canonical.lower()).ratio()
-            
-            candidates.append((ratio, artist_data))
+        top_results = result['results'][:3]
+        log = logger.get_logger()
+        started_at = time.monotonic()
+        # Each lookup is its own paced request; without a status line a
+        # multi-candidate ANV lookup can look frozen for several seconds
+        # between the search hit and the resolved artist name.
+        try:
+            for idx, search_result in enumerate(top_results, start=1):
+                timing_phrase = build_task_timing_phrase(
+                    total=len(top_results),
+                    completed=idx - 1,
+                    started_at=started_at,
+                )
+                log.status(f"[Artist match {idx} of {len(top_results)}] —— {timing_phrase}")
+
+                artist_id = search_result['id']
+                artist_data = await self._make_request(f"/artists/{artist_id}")
+
+                canonical = artist_data.get('name', '')
+                anvs = artist_data.get('namevariations', [])
+
+                # Check if exact match in canonical or ANVs
+                if canonical.lower() == artist.lower() or any(anv.lower() == artist.lower() for anv in anvs):
+                    ratio = 1.0
+                else:
+                    ratio = difflib.SequenceMatcher(None, artist.lower(), canonical.lower()).ratio()
+
+                candidates.append((ratio, artist_data))
+        finally:
+            log.clear_status()
         
         if not candidates:
             return []

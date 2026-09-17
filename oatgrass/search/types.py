@@ -1,5 +1,7 @@
 """Shared data structures for the search helpers."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 

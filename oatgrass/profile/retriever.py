@@ -128,7 +128,7 @@ class ProfileRetriever:
             page += 1
             page_limit = limit if max_items is None else min(limit, max_items - len(accepted_entries))
             page_progress = f"[Page {page}]" if known_total_pages is None else f"[Page {page} of {known_total_pages}]"
-            logger.info(
+            logger.progress(
                 f"[Task {task_index} of {task_total}] {page_progress} "
                 f"Fetching {list_type} (offset={current_offset}, limit={page_limit})"
             )
@@ -196,7 +196,7 @@ class ProfileRetriever:
                 "results may be partial for this list"
             )
 
-        logger.info(
+        logger.progress(
             f"[Task {task_index} of {task_total}] [Page {page}] Completed {list_type}: "
             f"accepted={len(accepted_entries)}, possible_non_music={possible_non_music}, "
             f"malformed_numeric={malformed_numeric}, "
@@ -264,7 +264,7 @@ class ProfileRetriever:
             except (asyncio.TimeoutError, ClientConnectionError, aiohttp.ServerTimeoutError):
                 if attempt >= MAX_PAGE_RETRIES:
                     raise
-                delay = 2 ** attempt
+                delay = 2 ** (attempt + 2)  # starts at 8s, not 2s -- gentler on the tracker
                 logger.warning(
                     f"{self.tracker.name.upper()} timeout while fetching {list_type} page {page}; "
                     f"retrying in {delay}s (attempt {attempt}/{MAX_PAGE_RETRIES})"

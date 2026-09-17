@@ -1,5 +1,7 @@
 """Format edition data for display (Stage 3)."""
 
+from __future__ import annotations
+
 from typing import Callable, List, Optional, TextIO
 
 from oatgrass.search.types import EditionInfo, GroupInfo

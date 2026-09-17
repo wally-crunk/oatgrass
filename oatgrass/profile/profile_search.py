@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from oatgrass import logger
+from oatgrass import rate_limits
 from oatgrass.config import OatgrassConfig, TrackerConfig
 from oatgrass.progress_timing import build_task_timing_phrase
 from oatgrass.profile.retriever import ListType, ProfileTorrent
@@ -88,7 +89,7 @@ async def _progress_heartbeat(state: _ProgressState) -> None:
         await asyncio.sleep(PROFILE_SEARCH_PROGRESS_HEARTBEAT_SECONDS)
         if state.done:
             break
-        log.status(_render_progress_line(state))
+        log.set_live_task(lambda: _render_progress_line(state))
 
 
 def _emit_progress_status(
@@ -101,7 +102,7 @@ def _emit_progress_status(
     state.completed = idx
     state.skipped = skipped
     state.candidates = candidates
-    logger.get_logger().status(_render_progress_line(state))
+    logger.get_logger().set_live_task(lambda: _render_progress_line(state))
 
 
 def _cross_upload_torrent_url(tracker: TrackerConfig, torrent_id: int) -> str:
@@ -429,6 +430,9 @@ async def run_profile_search_workflow(
     logger.set_logger(logger.OatgrassLogger(log_path))
     from oatgrass.rate_limits import describe_slow_mode
 
+    # Always announce (not describe_slow_mode_once()): this run gets its own
+    # fresh log file and must document its own settings regardless of
+    # whether a prior menu screen already showed the notice elsewhere.
     if slow_mode_note := describe_slow_mode():
         logger.info(slow_mode_note)
     logger.info("[Profile Search] Cached list mode")
@@ -448,92 +452,108 @@ async def run_profile_search_workflow(
     policy_summary = PolicySummary()
     lookup_cache = _ProfileLookupCache()
     progress = _ProgressState(total=len(entries), started_at=time.monotonic())
-    heartbeat_task = asyncio.create_task(_progress_heartbeat(progress))
-    try:
-        total = len(entries)
-        for idx, entry in enumerate(entries, start=1):
-            progress.current_index = idx
-            group_id = entry.group_id if entry.group_id is not None else "?"
-            torrent_id = entry.torrent_id if entry.torrent_id is not None else "?"
-            timing_phrase = build_task_timing_phrase(
-                total=total,
-                completed=idx - 1,
-                started_at=progress.started_at,
-            )
-            logger.info(f"[Task {idx} of {total}] —— {timing_phrase}")
-            logger.info(
-                f"   {source_tracker.name.lower()} group #{group_id} "
-                f"torrent #{torrent_id} '{entry.group_name or ''}'"
-            )
-            evaluation = ProfileEntryEvaluation(candidate_urls=[], suppressed_messages=[], policy_summary=PolicySummary())
-            was_skipped = False
-            try:
-                evaluation, was_skipped = await run_with_retries(
-                    lambda: _evaluate_profile_entry(
-                        entry,
-                        source_tracker,
-                        opposite_tracker,
-                        source_client,
-                        target_client,
-                        group_only=group_only,
-                        candidate_policy=candidate_policy,
-                        lookup_cache=lookup_cache,
-                    ),
-                    max_attempts=PROFILE_ENTRY_MAX_ATTEMPTS,
-                    on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
-                        f"Transient profile entry failure ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}); "
-                        f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
-                    ),
-                )
-            except Exception as exc:  # pragma: no cover - guard for network/API errors
-                logger.warning(
-                    f"Entry failed after retries ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}): {exc}"
-                )
-                was_skipped = True
 
-            if was_skipped:
-                skipped += 1
-            else:
-                policy_summary.merge(evaluation.policy_summary)
-                if evaluation.suppressed_messages and not abbrev:
-                    for message in evaluation.suppressed_messages:
-                        logger.info(f"   {message}")
-
-            if was_skipped:
-                pass
-            elif evaluation.candidate_urls:
+    # A pacing wait triggered by any entry's API call also goes through
+    # log.status() -- live_progress() braces it under the progress heartbeat
+    # line instead of clobbering it, matching the same [Task N of M] / wait
+    # pairing group_search.py uses.
+    with logger.get_logger().live_progress():
+        heartbeat_task = asyncio.create_task(_progress_heartbeat(progress))
+        try:
+            total = len(entries)
+            for idx, entry in enumerate(entries, start=1):
+                progress.current_index = idx
+                group_id = entry.group_id if entry.group_id is not None else "?"
+                torrent_id = entry.torrent_id if entry.torrent_id is not None else "?"
+                timing_phrase = build_task_timing_phrase(
+                    total=total,
+                    completed=idx - 1,
+                    started_at=progress.started_at,
+                )
+                logger.progress(f"[Task {idx} of {total}] —— {timing_phrase}")
+                # Populate the live task line immediately (not just via the
+                # periodic heartbeat or after this entry finishes) so a
+                # pacing wait during this entry's own API calls has
+                # something to brace under from the start.
+                logger.get_logger().set_live_task(lambda: _render_progress_line(progress))
                 logger.info(
-                    f"   Candidate found: {len(evaluation.candidate_urls)} candidate(s) "
-                    f"for source torrent #{entry.torrent_id}"
+                    f"{source_tracker.name.lower()} group #{group_id} "
+                    f"torrent #{torrent_id} '{entry.group_name or ''}'",
+                    indent=3,
                 )
-                candidates.extend(evaluation.candidate_urls)
-            else:
-                logger.info("   Match found on target. Not a candidate.")
+                evaluation = ProfileEntryEvaluation(candidate_urls=[], suppressed_messages=[], policy_summary=PolicySummary())
+                was_skipped = False
+                try:
+                    evaluation, was_skipped = await run_with_retries(
+                        lambda: _evaluate_profile_entry(
+                            entry,
+                            source_tracker,
+                            opposite_tracker,
+                            source_client,
+                            target_client,
+                            group_only=group_only,
+                            candidate_policy=candidate_policy,
+                            lookup_cache=lookup_cache,
+                        ),
+                        max_attempts=PROFILE_ENTRY_MAX_ATTEMPTS,
+                        on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
+                            f"Transient profile entry failure ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}); "
+                            f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
+                        ),
+                    )
+                except rate_limits.PacingCoordinationUnavailable:
+                    raise
+                except Exception as exc:  # pragma: no cover - guard for network/API errors
+                    if not logger.was_reported(exc):
+                        logger.warning(
+                            f"Entry failed after retries ({source_tracker.name.upper()} group #{group_id} torrent #{torrent_id}): {exc}"
+                        )
+                    was_skipped = True
 
-            _emit_progress_status(
-                progress,
-                idx=idx,
-                skipped=skipped,
-                candidates=len(candidates),
-            )
-            if not was_skipped and idx < total:
-                await asyncio.sleep(0.01)
-    finally:
-        progress.done = True
-        heartbeat_task.cancel()
-        await asyncio.gather(heartbeat_task, return_exceptions=True)
-        logger.get_logger().clear_status()
-        await source_client.close()
-        await target_client.close()
-        if candidate_policy != CandidatePolicy.STANDARD:
-            logger.info("[Policy Summary]")
-            logger.info(f"   Promoted: {policy_summary.promoted}")
-            logger.info(f"   Demoted: {policy_summary.demoted}")
-            logger.info(f"   Excluded by policy: {policy_summary.excluded_by_policy}")
-            logger.info(f"   Dropped duplicate 24-bit Vinyl: {policy_summary.duplicate_24bit}")
-            logger.info(f"   Suppressed total: {policy_summary.suppressed_total}")
-        logger.info(f"Output mirrored to {log_path}")
-        logger.get_logger().close()
+                if was_skipped:
+                    skipped += 1
+                else:
+                    policy_summary.merge(evaluation.policy_summary)
+                    if evaluation.suppressed_messages and not abbrev:
+                        for message in evaluation.suppressed_messages:
+                            logger.info(message, indent=3)
+
+                if was_skipped:
+                    pass
+                elif evaluation.candidate_urls:
+                    logger.info(
+                        f"Candidate found: {len(evaluation.candidate_urls)} candidate(s) "
+                        f"for source torrent #{entry.torrent_id}",
+                        indent=3,
+                    )
+                    candidates.extend(evaluation.candidate_urls)
+                else:
+                    logger.info("Match found on target. Not a candidate.", indent=3)
+
+                _emit_progress_status(
+                    progress,
+                    idx=idx,
+                    skipped=skipped,
+                    candidates=len(candidates),
+                )
+                if not was_skipped and idx < total:
+                    await asyncio.sleep(0.01)
+        finally:
+            progress.done = True
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            logger.get_logger().clear_status()
+            await source_client.close()
+            await target_client.close()
+            if candidate_policy != CandidatePolicy.STANDARD:
+                logger.info("[Policy Summary]")
+                logger.info(f"Promoted: {policy_summary.promoted}", indent=3)
+                logger.info(f"Demoted: {policy_summary.demoted}", indent=3)
+                logger.info(f"Excluded by policy: {policy_summary.excluded_by_policy}", indent=3)
+                logger.info(f"Dropped duplicate 24-bit Vinyl: {policy_summary.duplicate_24bit}", indent=3)
+                logger.info(f"Suppressed total: {policy_summary.suppressed_total}", indent=3)
+            logger.get_logger().log(f"Output mirrored to {log_path}", "[INFO] ")
+            logger.get_logger().close()
 
     processed = len(entries) - skipped
     return ProfileSearchResult(

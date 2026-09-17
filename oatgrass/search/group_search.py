@@ -9,9 +9,22 @@ from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
 from oatgrass.config import OatgrassConfig, TrackerConfig
-from oatgrass.progress_timing import build_task_timing_phrase
+from oatgrass import rate_limits
+from oatgrass.progress_timing import (
+    build_task_timing_phrase,
+    format_elapsed_clock,
+    format_progress_bar,
+    format_remaining,
+)
 from oatgrass.search.formatters import (
     emit as _emit,
+    emit_error as _emit_error,
+    emit_success as _emit_success,
+    emit_warning as _emit_warning,
+    emit_result_candidate as _emit_result_candidate,
+    emit_result_possible_candidate as _emit_result_possible_candidate,
+    emit_result_duplicate as _emit_result_duplicate,
+    emit_progress as _emit_progress,
     display_value as _display_value,
     format_compact_result as _format_compact_result,
     format_size as _format_size,
@@ -33,6 +46,7 @@ from oatgrass.search.url_utils import (
 )
 from oatgrass.search.gazelle_client import GazelleServiceAdapter
 from oatgrass.search.resilience import (
+    describe_exception,
     optional_list_of_dicts,
     response_payload,
     run_with_retries,
@@ -78,7 +92,7 @@ async def _search_entry_with_retries(
         max_attempts=SEARCH_ENTRY_MAX_ATTEMPTS,
         on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
             f"Transient entry failure ({source_tracker_name} group #{source_group_label}); "
-            f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
+            f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {describe_exception(exc)}"
         ),
     )
 
@@ -102,7 +116,7 @@ async def _fetch_group_entries_with_retries(tracker: TrackerConfig, group_id: in
         max_attempts=SEARCH_ENTRY_MAX_ATTEMPTS,
         on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
             f"Transient group fetch failure ({tracker.name.upper()} group #{group_id}); "
-            f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
+            f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {describe_exception(exc)}"
         ),
     )
 
@@ -175,27 +189,84 @@ async def _fetch_collage_entries(tracker: TrackerConfig, collage_id: int, start_
     """Fetch collage entries across all pages from start_page onward."""
     entries: list[dict] = []
     page = max(1, start_page)
-    while True:
-        async def _fetch_and_parse_page() -> tuple[list[dict], int | None]:
-            collage_response = await _fetch_collage(tracker, collage_id, page)
-            response = response_payload(collage_response, "Collage")
-            page_entries = optional_list_of_dicts(response, "torrentgroups", "Collage")
-            return page_entries, _parse_total_collage_pages(response)
+    total_pages: int | None = None
+    log = logger.get_logger()
+    started_at = time.monotonic()
+    # Multi-page collages can take a long time under heavy pacing (each page
+    # is its own paced request) with nothing else printed between pages --
+    # without this, a large collage looks completely frozen until every page
+    # has been fetched. live_progress() renders a task line (this page, its
+    # projected remaining time) and, only while a wait is actually in
+    # progress, a braced "waiting" line under it -- two separate facts
+    # instead of one long line straining to say both, and Rich's Live tracks
+    # its own rendered height so a wrap on a narrow terminal can't corrupt
+    # it the way the old single-row "\r" overwrite could.
+    with log.live_progress():
+        while True:
+            page_label = f"[Page {page} of {total_pages}]" if total_pages else f"[Page {page}]"
+            # None until total_pages is known (page 1) -- there's nothing
+            # meaningful to project a total from yet.
+            remaining_pages = (total_pages - page + 1) if total_pages else None
 
-        page_entries, total_pages = await run_with_retries(
-            _fetch_and_parse_page,
-            max_attempts=COLLAGE_FETCH_MAX_ATTEMPTS,
-            on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
-                f"Transient collage fetch failure ({tracker.name.upper()} collage #{collage_id} page {page}); "
-                f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {exc}"
-            ),
-        )
-        if not page_entries:
-            break
-        entries.extend(page_entries)
-        if total_pages is None or page >= total_pages:
-            break
-        page += 1
+            def _current_task_text(
+                _page_label: str = page_label,
+                _remaining_pages: int | None = remaining_pages,
+                _page: int = page,
+                _total_pages: int | None = total_pages,
+            ) -> str:
+                # Recomputed on every render (not a frozen string) so elapsed
+                # keeps ticking for as long as this task line is on screen --
+                # including while a wait line is braced under it, which can
+                # itself run for tens of seconds.
+                elapsed_text = format_elapsed_clock(time.monotonic() - started_at)
+                participant_count = rate_limits.get_last_known_participant_count(tracker.name)
+                session_word = "session" if participant_count == 1 else "sessions"
+                # The remaining-time figure is projected from the tracker's
+                # own pacing scheme (requests/window * remaining pages *
+                # last-known participant count) rather than this call's
+                # historical throughput -- a blended average of fetch
+                # latency and pacing waits reacts far too slowly to a real
+                # regime change (e.g. other OATGRASS sessions joining
+                # mid-run).
+                if _remaining_pages is None:
+                    per_page = rate_limits.estimate_pacing_wait_seconds(
+                        tracker.name, "collage", remaining_requests=1, active_participant_count=participant_count
+                    )
+                    pace_text = f"~{round(per_page)}s/page" if per_page is not None else "pace unknown"
+                    bar = ""
+                else:
+                    total_wait = rate_limits.estimate_pacing_wait_seconds(
+                        tracker.name, "collage", remaining_requests=_remaining_pages, active_participant_count=participant_count
+                    )
+                    pace_text = f"~{format_remaining(total_wait)} left" if total_wait is not None else "pace unknown"
+                    # Narrower than the default (25): this line's budget also
+                    # has to fit page/session numbers that can run to several
+                    # digits, unlike the wait line's fixed-width wording.
+                    bar = f" {format_progress_bar((_page - 1) / _total_pages, width=18)}"
+                return f"{_page_label} —— {elapsed_text} elapsed, {pace_text} ({participant_count} {session_word}){bar}"
+
+            log.set_live_task(_current_task_text)
+
+            async def _fetch_and_parse_page() -> tuple[list[dict], int | None]:
+                collage_response = await _fetch_collage(tracker, collage_id, page)
+                response = response_payload(collage_response, "Collage")
+                page_entries = optional_list_of_dicts(response, "torrentgroups", "Collage")
+                return page_entries, _parse_total_collage_pages(response)
+
+            page_entries, total_pages = await run_with_retries(
+                _fetch_and_parse_page,
+                max_attempts=COLLAGE_FETCH_MAX_ATTEMPTS,
+                on_retry=lambda attempt, max_attempts, delay, exc: logger.warning(
+                    f"Transient collage fetch failure ({tracker.name.upper()} collage #{collage_id} page {page}); "
+                    f"retrying in {delay}s (attempt {attempt}/{max_attempts}): {describe_exception(exc)}"
+                ),
+            )
+            if not page_entries:
+                break
+            entries.extend(page_entries)
+            if total_pages is None or page >= total_pages:
+                break
+            page += 1
     return entries
 
 def _resolve_tracker_by_key(trackers: dict[str, TrackerConfig], key: str) -> TrackerConfig:
@@ -262,7 +333,7 @@ def _emit_final_candidates(
         return
 
     _emit("")
-    _emit("[End of Run]")
+    _emit_progress("[End of Run]")
 
     if cross_upload_candidates:
         _emit("Explore the following for possible upload:", indent=3)
@@ -306,7 +377,6 @@ async def run_group_search_workflow(
     strict: bool = False,
     log: bool = True,
     abbrev: bool = False,
-    verbose: bool = False,
     debug: bool = False,
     basic: bool = False,
     no_discogs: bool = False,
@@ -317,10 +387,10 @@ async def run_group_search_workflow(
     if log:
         out_dir = output_dir or Path("output")
         log_path = _next_run_path(out_dir)
-        log_instance = logger.OatgrassLogger(log_path, debug=debug)
+        log_instance = logger.OatgrassLogger(log_path, debug=debug, show_pacing_status=not abbrev)
         logger.set_logger(log_instance)
     else:
-        logger.set_logger(logger.OatgrassLogger(debug=debug))
+        logger.set_logger(logger.OatgrassLogger(debug=debug, show_pacing_status=not abbrev))
     
     collage_url = None
     entries: list[dict] = []
@@ -334,6 +404,9 @@ async def run_group_search_workflow(
     try:
         from oatgrass.rate_limits import describe_slow_mode
 
+        # Always announce (not describe_slow_mode_once()): this run gets its
+        # own fresh log file and must document its own settings regardless of
+        # whether a prior menu screen already showed the notice elsewhere.
         if slow_mode_note := describe_slow_mode():
             logger.info(slow_mode_note)
         try:
@@ -343,23 +416,23 @@ async def run_group_search_workflow(
                 tracker_key,
             )
         except ValueError as exc:
-            _emit(f"[red]{exc}[/red]")
+            _emit_error(str(exc))
             return
         except Exception as exc:  # pragma: no cover
-            _emit(f"[red]Failed to load entries:[/red] {exc}")
+            _emit_error(f"Failed to load entries: {exc}")
             return
 
         if not entries:
-            _emit("[yellow]No entries found for the provided input.[/yellow]")
+            _emit_warning("No entries found for the provided input.")
             return
 
         if not source_tracker or not opposite_tracker:
-            _emit("[red]Tracker configuration is incomplete.[/red]")
+            _emit_error("Tracker configuration is incomplete.")
             return
 
         total = len(entries)
         source_label = collage_url or f"group {target}"
-        _emit("[bold]Search mode: find cross-upload candidates[/bold]")
+        _emit("Search mode: find cross-upload candidates")
         _emit(f"Source input: {source_label}")
         _emit(f"Source tracker: {source_tracker.name}")
         _emit(f"Opposite tracker: {opposite_tracker.name}")
@@ -380,7 +453,7 @@ async def run_group_search_workflow(
             gazelle_client = GazelleServiceAdapter(opposite_tracker)
             source_client = GazelleServiceAdapter(source_tracker)
         except ValueError as exc:
-            _emit(f"[red]Could not initialize Gazelle client:[/red] {exc}")
+            _emit_error(f"Could not initialize Gazelle client: {exc}")
             return
         
         if config.api_keys.discogs_key and not no_discogs:
@@ -388,249 +461,307 @@ async def run_group_search_workflow(
                 from oatgrass.search.discogs_service import DiscogsService
                 discogs_service = DiscogsService(config.api_keys.discogs_key)
             except Exception as e:
-                _emit(f"[yellow]Warning: Discogs initialization failed: {e}. Tier 5 search will be skipped.[/yellow]")
+                _emit_warning(f"Discogs initialization failed: {e}. Tier 5 search will be skipped.")
 
         cross_upload_candidates = []
         policy_summary = PolicySummary()
         enrichment_cache: dict[int, dict] = {}
         placeholder_skipped = 0
-        show_task_context = (verbose or debug) and not abbrev
+        show_task_context = not abbrev
         started_at = time.monotonic()
 
-        for idx, entry in enumerate(entries, start=1):
-            search_context = _build_search_context(entry)
-            source_gid = _group_id(entry)
-            source_group_label = source_gid if source_gid is not None else "?"
-            def _emit_task_context(target_gid: int | None) -> None:
-                if show_task_context:
-                    _emit(
-                        _format_task_context_line(
-                            source_tracker.name,
-                            source_group_label,
-                            opposite_tracker.name,
-                            target_gid,
-                        ),
-                        indent=3,
+        try:
+            with logger.get_logger().live_progress():
+                for idx, entry in enumerate(entries, start=1):
+                    search_context = _build_search_context(entry)
+                    source_gid = _group_id(entry)
+                    source_group_label = source_gid if source_gid is not None else "?"
+                    def _emit_task_context(target_gid: int | None) -> None:
+                        if show_task_context:
+                            _emit(
+                                _format_task_context_line(
+                                    source_tracker.name,
+                                    source_group_label,
+                                    opposite_tracker.name,
+                                    target_gid,
+                                ),
+                                indent=3,
+                            )
+
+                    # Computed unconditionally (not gated on abbrev): compact mode
+                    # folds this into its one-line result instead of a separate
+                    # header, but it must not drop the elapsed/remaining/ETA data
+                    # entirely -- that was a real information loss, not just a
+                    # density trade.
+                    timing_phrase = build_task_timing_phrase(
+                        total=total,
+                        completed=idx - 1,
+                        started_at=started_at,
                     )
-
-            if not abbrev:
-                timing_phrase = build_task_timing_phrase(
-                    total=total,
-                    completed=idx - 1,
-                    started_at=started_at,
-                )
-                _emit("")
-                _emit(f"[Task {idx} of {total}] —— {timing_phrase}")
-
-            hit = None
-            used_tier = 1
-            try:
-                if _is_placeholder_only_search_context(search_context):
-                    placeholder_skipped += 1
                     if not abbrev:
-                        _emit(
-                            "[yellow]Skipping target search: source artist/album metadata is placeholder-only.[/yellow]",
-                            indent=3,
-                        )
-                else:
-                    if strict and not abbrev:
-                        _emit(
-                            f"Tier 1 search: artist='{search_context.artist}', album='{search_context.album}', year={search_context.year}",
-                            indent=3,
-                        )
+                        _emit("")
+                        _emit_progress(f"[Task {idx} of {total}] —— {timing_phrase}")
 
-                    result = await _search_entry_with_retries(
-                        gazelle_client,
-                        source_tracker_name=source_tracker.name.upper(),
-                        source_group_label=source_group_label,
-                        artist=search_context.artist,
-                        album=search_context.album,
-                        year=search_context.year,
-                        release_type=search_context.release_type,
-                        media=search_context.media,
-                        max_tier=1 if strict else 4,
-                    )
-                    if result:
-                        hit = result
-                        used_tier = 1
+                        def _current_task_text(_idx: int = idx, _total: int = total) -> str:
+                            # Recomputed on every render (not a frozen string) so
+                            # elapsed keeps ticking while a pacing-wait line is
+                            # braced under this entry's task header.
+                            return f"[Task {_idx} of {_total}] —— {build_task_timing_phrase(total=_total, completed=_idx - 1, started_at=started_at)}"
 
-                    if not hit and not strict and discogs_service and search_context.artist and search_context.album:
-                        if not abbrev:
-                            _emit("Tier 5 Discogs search: querying artist variations", indent=3)
+                        logger.get_logger().set_live_task(_current_task_text)
 
-                        cache_key = f"{search_context.artist}|{search_context.album}"
-                        if cache_key not in discogs_cache:
-                            try:
-                                artist_variations = await discogs_service.get_artist_variations(
-                                    search_context.artist,
-                                    search_context.album,
-                                    search_context.year
-                                )
-                                discogs_cache[cache_key] = artist_variations
-                            except Exception:
-                                discogs_cache[cache_key] = []
-                        for artist_variant in discogs_cache.get(cache_key, []):
+                    hit = None
+                    used_tier = 1
+                    try:
+                        if _is_placeholder_only_search_context(search_context):
+                            placeholder_skipped += 1
                             if not abbrev:
-                                _emit(f"Tier 5 tracker search: artist='{artist_variant}', album='{search_context.album}'", indent=3)
+                                _emit_warning(
+                                    "Skipping target search: source artist/album metadata is placeholder-only.",
+                                    indent=3,
+                                )
+                        else:
+                            if strict and not abbrev:
+                                _emit(
+                                    f"Tier 1 search: artist='{search_context.artist}', album='{search_context.album}', year={search_context.year}",
+                                    indent=3,
+                                )
+
                             result = await _search_entry_with_retries(
                                 gazelle_client,
                                 source_tracker_name=source_tracker.name.upper(),
                                 source_group_label=source_group_label,
-                                artist=artist_variant,
+                                artist=search_context.artist,
                                 album=search_context.album,
                                 year=search_context.year,
-                                release_type=None,
-                                media=None,
-                                max_tier=4,
+                                release_type=search_context.release_type,
+                                media=search_context.media,
+                                max_tier=1 if strict else 4,
                             )
                             if result:
                                 hit = result
-                                used_tier = 5
+                                used_tier = 1
+
+                            if not hit and not strict and discogs_service and search_context.artist and search_context.album:
                                 if not abbrev:
-                                    _emit("[green]Tier 5 match found[/green]", indent=3)
-                                break
-                            await asyncio.sleep(0.5)
+                                    _emit("Tier 5 Discogs search: querying artist variations", indent=3)
 
-                collage_max = _collage_max_size(entry)
-                if not basic and hit and source_gid:
-                    from oatgrass.search.edition_aware_mode import process_entry_edition_aware
-                    try:
-                        _target_gid, edition_candidates, suppression_messages, entry_summary = await process_entry_edition_aware(
-                            entry, source_tracker, opposite_tracker,
-                            source_client, gazelle_client,
-                            _emit,
-                            abbrev,
-                            verbose,
-                            candidate_policy=candidate_policy,
-                            show_context_line=show_task_context,
-                            enrichment_cache=enrichment_cache,
-                        )
-                        policy_summary.merge(entry_summary)
-                        if not abbrev:
-                            for message in suppression_messages:
-                                _emit(message, indent=3)
-                        if edition_candidates:
-                            cross_upload_candidates.extend(edition_candidates)
-                        if idx < total:
-                            await asyncio.sleep(0.005)
-                        continue
-                    except Exception as e:
-                        if not abbrev:
-                            _emit(f"[yellow]Edition-aware processing failed: {e}. Falling back to basic mode.[/yellow]", indent=3)
+                                cache_key = f"{search_context.artist}|{search_context.album}"
+                                if cache_key not in discogs_cache:
+                                    if not abbrev:
+                                        # One external network round-trip with nothing else
+                                        # printed around it -- without this, it can look
+                                        # frozen between the static "querying" line above
+                                        # and whatever prints next.
+                                        logger.get_logger().status(
+                                            f"   Querying Discogs for '{search_context.artist}' name variations..."
+                                        )
+                                    try:
+                                        artist_variations = await discogs_service.get_artist_variations(
+                                            search_context.artist,
+                                            search_context.album,
+                                            search_context.year
+                                        )
+                                        discogs_cache[cache_key] = artist_variations
+                                    except Exception:
+                                        discogs_cache[cache_key] = []
+                                for artist_variant in discogs_cache.get(cache_key, []):
+                                    if not abbrev:
+                                        _emit(f"Tier 5 tracker search: artist='{artist_variant}', album='{search_context.album}'", indent=3)
+                                    result = await _search_entry_with_retries(
+                                        gazelle_client,
+                                        source_tracker_name=source_tracker.name.upper(),
+                                        source_group_label=source_group_label,
+                                        artist=artist_variant,
+                                        album=search_context.album,
+                                        year=search_context.year,
+                                        release_type=None,
+                                        media=None,
+                                        max_tier=4,
+                                    )
+                                    if result:
+                                        hit = result
+                                        used_tier = 5
+                                        if not abbrev:
+                                            _emit_success("Tier 5 match found", indent=3)
+                                        break
+                                    await asyncio.sleep(0.5)
 
-                if not hit:
-                    if candidate_policy != CandidatePolicy.STANDARD and source_gid is not None and source_client is not None:
-                        no_match_candidates, suppression_messages, entry_summary = await _evaluate_no_match_policy_candidates(
-                            entry,
-                            source_tracker=source_tracker,
-                            source_client=source_client,
-                            policy=candidate_policy,
-                            enrichment_cache=enrichment_cache,
-                        )
-                        policy_summary.merge(entry_summary)
-                        if not abbrev:
-                            _emit_task_context(None)
-                            _emit(
-                                "[yellow]No matching group found on the opposite tracker.[/yellow]",
-                                indent=3,
-                            )
-                            for message in suppression_messages:
-                                _emit(message, indent=3)
-                            if no_match_candidates:
+                        collage_max = _collage_max_size(entry)
+                        if not basic and hit and source_gid:
+                            from oatgrass.search.edition_aware_mode import process_entry_edition_aware
+                            try:
+                                _target_gid, edition_candidates, suppression_messages, entry_summary = await process_entry_edition_aware(
+                                    entry, source_tracker, opposite_tracker,
+                                    source_client, gazelle_client,
+                                    _emit,
+                                    _emit_warning,
+                                    abbrev,
+                                    candidate_policy=candidate_policy,
+                                    show_context_line=show_task_context,
+                                    enrichment_cache=enrichment_cache,
+                                    emit_result_candidate_func=_emit_result_candidate,
+                                    emit_result_duplicate_func=_emit_result_duplicate,
+                                )
+                                policy_summary.merge(entry_summary)
+                                if not abbrev:
+                                    for message in suppression_messages:
+                                        _emit(message, indent=3)
+                                if edition_candidates:
+                                    cross_upload_candidates.extend(edition_candidates)
+                                if idx < total:
+                                    await asyncio.sleep(0.005)
+                                continue
+                            except Exception as e:
+                                if not abbrev:
+                                    if logger.is_internal_defect(e):
+                                        # Distinguish a genuine internal bug from a routine
+                                        # failure (throttle, network hiccup) reaching this
+                                        # catch, so a real defect isn't shown with the same
+                                        # reassuring "Falling back to basic mode" wording as
+                                        # expected pacing pushback.
+                                        _emit_warning(
+                                            f"Edition-aware processing hit an unexpected internal error "
+                                            f"({type(e).__name__}: {e}); falling back to basic mode.",
+                                            indent=3,
+                                        )
+                                    else:
+                                        _emit_warning(
+                                            f"Edition-aware processing failed ({e}); falling back to basic mode.",
+                                            indent=3,
+                                        )
+
+                        if not hit:
+                            if candidate_policy != CandidatePolicy.STANDARD and source_gid is not None and source_client is not None:
+                                no_match_candidates, suppression_messages, entry_summary = await _evaluate_no_match_policy_candidates(
+                                    entry,
+                                    source_tracker=source_tracker,
+                                    source_client=source_client,
+                                    policy=candidate_policy,
+                                    enrichment_cache=enrichment_cache,
+                                )
+                                policy_summary.merge(entry_summary)
+                                if not abbrev:
+                                    _emit_task_context(None)
+                                    _emit(
+                                        "No matching group found on the opposite tracker.",
+                                        indent=3,
+                                    )
+                                    for message in suppression_messages:
+                                        _emit(message, indent=3)
+                                    if no_match_candidates:
+                                        _emit_result_candidate(
+                                            f"No matching group found. {len(no_match_candidates)} policy-eligible upload candidate(s).",
+                                            indent=3,
+                                        )
+                                    else:
+                                        _emit("No matching group found. No policy-eligible upload candidates.", indent=3)
+                                cross_upload_candidates.extend(no_match_candidates)
+                                if idx < total:
+                                    await asyncio.sleep(0.005)
+                                continue
+
+                            if abbrev:
+                                if source_gid is not None:
+                                    suggestion = _cross_upload_url(source_tracker, source_gid)
+                                    cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
+                                    compact = _format_compact_result(
+                                        idx, total, timing_phrase, source_tracker, source_gid,
+                                        opposite_tracker, None, collage_max, None, used_tier, suggestion
+                                    )
+                                    _emit(compact)
+                            else:
+                                _emit_task_context(None)
+                                if source_gid is not None:
+                                    suggestion = _cross_upload_url(source_tracker, source_gid)
+                                    cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
+                                    # No group at all on the opposite tracker is the
+                                    # clearest possible verdict: this is a candidate,
+                                    # not a warning about the run.
+                                    _emit_result_candidate(
+                                        "No matching group found on the opposite tracker.",
+                                        indent=3,
+                                    )
+                                    _emit("Suggestion:", indent=3)
+                                    _emit(
+                                        f"  Explore {suggestion} for possible cross-upload to {opposite_tracker.name.upper()}",
+                                        indent=3,
+                                    )
+                                else:
+                                    _emit_warning(
+                                        "No matching group found on the opposite tracker.",
+                                        indent=3,
+                                    )
+                        else:
+                            search_max = _extract_search_max(hit)
+                            hit_group_id = hit.get('groupId') if isinstance(hit, dict) else hit.group_id
+                            hit_title = hit.get('groupName', 'Unknown') if isinstance(hit, dict) else hit.title
+
+                            if abbrev:
+                                compact = _format_compact_result(
+                                    idx, total, timing_phrase, source_tracker, source_gid or 0,
+                                    opposite_tracker, hit_group_id, collage_max, search_max, used_tier
+                                )
+                                _emit(compact)
+                            else:
+                                _emit_task_context(hit_group_id)
                                 _emit(
-                                    f"[yellow]No matching group found. {len(no_match_candidates)} policy-eligible upload candidate(s).[/yellow]",
+                                    f"[Target, {opposite_tracker.name.upper()}] Found group: {hit_title} (ID {hit_group_id})",
                                     indent=3,
                                 )
-                            else:
-                                _emit("[cyan]No matching group found. No policy-eligible upload candidates.[/cyan]", indent=3)
-                        cross_upload_candidates.extend(no_match_candidates)
-                        if idx < total:
-                            await asyncio.sleep(0.005)
-                        continue
+                                source_label = f"[Source, {source_tracker.name.upper()}] Collage max torrent size:"
+                                source_size = _format_size(collage_max)
+                                _emit(_display_value(source_label, source_size), indent=3)
+                                target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
+                                target_size = _format_size(search_max)
+                                _emit(_display_value(target_label, target_size), indent=3)
 
-                    if abbrev:
-                        if source_gid is not None:
-                            suggestion = _cross_upload_url(source_tracker, source_gid)
-                            cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
-                            compact = _format_compact_result(
-                                idx, total, source_tracker, source_gid,
-                                opposite_tracker, None, collage_max, None, used_tier, suggestion
+                                if collage_max is None or search_max is None:
+                                    _emit_warning("Cannot determine max-size match (missing data).", indent=3)
+                                elif collage_max == search_max:
+                                    # Target already has this exact torrent -- a
+                                    # match-verdict, not confirmation the run itself
+                                    # went fine, so it gets its own vocabulary rather
+                                    # than [OK].
+                                    _emit_result_duplicate(
+                                        f"[Target, {opposite_tracker.name.upper()}] Max size matches.",
+                                        indent=3,
+                                    )
+                                else:
+                                    # Group exists but this size doesn't -- ambiguous
+                                    # (could be a genuine gap, could be mislabeled),
+                                    # worth a human look. Not an operational warning.
+                                    _emit_result_possible_candidate(
+                                        f"[Target, {opposite_tracker.name.upper()}] Max size mismatch.",
+                                        indent=3,
+                                    )
+                    except rate_limits.PacingCoordinationUnavailable:
+                        raise
+                    except Exception as exc:
+                        if not logger.was_reported(exc):
+                            logger.warning(
+                                f"Entry failed after retries ({source_tracker.name.upper()} group #{source_group_label}): {exc}"
                             )
-                            _emit(compact)
-                    else:
-                        _emit_task_context(None)
-                        _emit(
-                            "[yellow]No matching group found on the opposite tracker.[/yellow]",
-                            indent=3,
-                        )
-                        if source_gid is not None:
-                            suggestion = _cross_upload_url(source_tracker, source_gid)
-                            cross_upload_candidates.append((suggestion, 100))  # Priority 100 for missing group
-                            _emit("Suggestion:", indent=3)
-                            _emit(
-                                f"  Explore {suggestion} for possible cross-upload to {opposite_tracker.name.upper()}",
+                        if not abbrev:
+                            _emit_warning(
+                                "Entry failed after retry attempts; skipping this entry.",
                                 indent=3,
                             )
-                else:
-                    search_max = _extract_search_max(hit)
-                    hit_group_id = hit.get('groupId') if isinstance(hit, dict) else hit.group_id
-                    hit_title = hit.get('groupName', 'Unknown') if isinstance(hit, dict) else hit.title
 
-                    if abbrev:
-                        compact = _format_compact_result(
-                            idx, total, source_tracker, source_gid or 0,
-                            opposite_tracker, hit_group_id, collage_max, search_max, used_tier
-                        )
-                        _emit(compact)
-                    else:
-                        _emit_task_context(hit_group_id)
-                        _emit(
-                            f"[Target, {opposite_tracker.name.upper()}] Found group: {hit_title} (ID {hit_group_id})",
-                            indent=3,
-                        )
-                        source_label = f"[Source, {source_tracker.name.upper()}] Collage max torrent size:"
-                        source_size = _format_size(collage_max)
-                        _emit(_display_value(source_label, source_size), indent=3)
-                        target_label = f"[Target, {opposite_tracker.name.upper()}] Tracker max torrent size:"
-                        target_size = _format_size(search_max)
-                        _emit(_display_value(target_label, target_size), indent=3)
-
-                        if collage_max is None or search_max is None:
-                            _emit("[yellow]Cannot determine max-size match (missing data).[/yellow]", indent=3)
-                        elif collage_max == search_max:
-                            _emit(
-                                f"[Target, {opposite_tracker.name.upper()}] [green]Max size matches.[/green]",
-                                indent=3,
-                            )
-                        else:
-                            _emit(
-                                f"[Target, {opposite_tracker.name.upper()}] [yellow]Max size mismatch.[/yellow]",
-                                indent=3,
-                            )
-            except Exception as exc:
-                logger.warning(
-                    f"Entry failed after retries ({source_tracker.name.upper()} group #{source_group_label}): {exc}"
-                )
-                if not abbrev:
-                    _emit(
-                        "[yellow]Entry failed after retry attempts; skipping this entry.[/yellow]",
-                        indent=3,
-                    )
-
-            if idx < total:
-                await asyncio.sleep(0.005)
-
-        _emit_final_candidates(
-            entries,
-            cross_upload_candidates,
-            policy_summary if candidate_policy != CandidatePolicy.STANDARD else None,
-            placeholder_skipped=placeholder_skipped,
-        )
+                    if idx < total:
+                        await asyncio.sleep(0.005)
+        finally:
+            _emit_final_candidates(
+                entries,
+                cross_upload_candidates,
+                policy_summary if candidate_policy != CandidatePolicy.STANDARD else None,
+                placeholder_skipped=placeholder_skipped,
+            )
     finally:
         if source_client is not None:
             await source_client.close()
         if gazelle_client is not None:
             await gazelle_client.close()
         if log_path:
-            logger.info(f"Output mirrored to {log_path}")
+            logger.get_logger().log(f"Output mirrored to {log_path}", "[INFO] ")
         logger.get_logger().close()

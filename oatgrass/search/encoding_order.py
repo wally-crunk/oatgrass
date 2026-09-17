@@ -1,5 +1,7 @@
 """Shared encoding ranking rules for display and candidate selection."""
 
+from __future__ import annotations
+
 import re
 
 _BITRATE_RE = re.compile(r"\b(\d{2,4})\b")

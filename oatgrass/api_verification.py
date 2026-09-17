@@ -1,20 +1,18 @@
-"""
-api_verification.py - API key verification service for Oatgrass
-"""
+"""API key verification service for Oatgrass."""
+
+from __future__ import annotations
 
 import aiohttp
 import asyncio
 from rich.table import Table
 from rich.markup import escape
+from . import logger
 from .config import OatgrassConfig
-from .rate_limits import enforce_gazelle_min_interval
+from .rate_limits import PacingCoordinationUnavailable, enforce_gazelle_min_interval
 from .tracker_auth import build_tracker_auth_header
-from rich.console import Console
-from . import __version__
+from .__version__ import __version__
 
 UA = f"Oatgrass/{__version__}"
-
-console = Console()
 
 
 def _invalid_key_msg(detail: str) -> str:
@@ -83,9 +81,11 @@ async def verify_with_retry(verify_func, service_name, *args, max_retries=2, tim
             if attempt == max_retries:
                 return service_name, False, f"Connection failed after {max_retries + 1} attempts"
             
-            delay = 1 * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s...
-            console.print(f"[yellow]Retrying {service_name} in {delay}s...[/yellow]")
+            delay = 2 ** (attempt + 3)  # Exponential backoff starting at 8s, not 1s -- gentler on the service
+            logger.warning(f"Retrying {service_name} in {delay}s...")
             await asyncio.sleep(delay)
+        except PacingCoordinationUnavailable:
+            raise
         except Exception as e:
             # Catch-all to prevent crashes and surface a helpful message
             return service_name, False, f"Unexpected error: {type(e).__name__}: {e}"
@@ -93,7 +93,7 @@ async def verify_with_retry(verify_func, service_name, *args, max_retries=2, tim
 
 async def verify_api_keys(config: OatgrassConfig):
     """Verify all configured API keys"""
-    console.print("[cyan][INFO][/cyan] Verifying API Keys...")
+    logger.log("Verifying API Keys...", "[INFO] ")
     
     api_keys = config.api_keys 
     
@@ -137,9 +137,23 @@ async def verify_api_keys(config: OatgrassConfig):
         
         if not results:
             table.add_row("No Keys", "[yellow]⚠ Warning[/yellow]", "No API keys configured")
-        
-        console.print(table)
-        
+
+        logger.get_logger().console.print(table)
+
+        # The table above is screen-only (Rich renders it as one multi-cell
+        # object, not a plain log line) -- without this, a --verify run's
+        # actual results never reached the run log file at all. One plain
+        # line per result gives the log a durable record without changing
+        # the screen table.
+        if results:
+            for service, status, details in results:
+                summary = f"{service}: {'Valid' if status else 'Invalid'}"
+                if details:
+                    summary += f" - {details}"
+                logger.info(summary)
+        else:
+            logger.warning("No API keys configured")
+
         # Return True if all verifications passed
         if results:
             return all(status for _, status, _ in results)

@@ -1,5 +1,7 @@
 """5-tier search coordinator for edition-aware search."""
 
+from __future__ import annotations
+
 import re
 from html import unescape
 from typing import Optional

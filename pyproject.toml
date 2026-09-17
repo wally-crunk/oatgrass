@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oatgrass"
-version = "0.5.0"
+version = "0.6.0"
 description = "Oatgrass - feed the gazelles"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -20,3 +20,10 @@ dependencies = [
 
 [project.scripts]
 oatgrass = "oatgrass.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["oatgrass*"]
+exclude = ["dev*", "docs*", "output*", "reference*", "scripts*", "tests*", "tmp*"]
+
+[tool.setuptools.data-files]
+"." = ["SPIGOT-v0.md"]

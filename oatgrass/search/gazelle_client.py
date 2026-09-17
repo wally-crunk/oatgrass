@@ -15,7 +15,9 @@ from oatgrass.rate_limits import (
     compute_throttle_retry_delay,
     enforce_gazelle_min_interval,
     get_effective_interval,
+    record_gazelle_throttle,
 )
+from oatgrass import spigot
 from oatgrass.search.protocols import GazelleClient
 from oatgrass.search.types import GazelleSearchResult
 from oatgrass.tracker_auth import build_tracker_auth_header
@@ -24,6 +26,10 @@ from oatgrass.__version__ import __version__
 
 DEFAULT_USER_AGENT = f"Oatgrass/{__version__}"
 _T = TypeVar("_T")
+
+
+class GazelleThrottleResponse(RuntimeError):
+    """Raised when a Gazelle payload reports throttling despite HTTP 200."""
 
 
 class GazelleServiceAdapter(GazelleClient):
@@ -37,7 +43,7 @@ class GazelleServiceAdapter(GazelleClient):
         min_interval_seconds: float = GAZELLE_MIN_INTERVAL_SECONDS,
     ):
         if not tracker.api_key:
-            raise ValueError("Gazelle tracker API key is required for search adapter.")
+            raise ValueError("Gazelle tracker API key is required for search adapter. Add keys in the file `config.toml`.")
 
         self.tracker = tracker
         self.timeout = timeout
@@ -46,6 +52,7 @@ class GazelleServiceAdapter(GazelleClient):
         self._min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        self._account_identity = spigot.BOOTSTRAP_ACCOUNT_ID
 
     async def search(
         self,
@@ -135,7 +142,7 @@ class GazelleServiceAdapter(GazelleClient):
             session = await self._ensure_session()
             for attempt in range(max_retries):
                 try:
-                    await self._enforce_interval()
+                    await self._enforce_interval(params)
                     async with session.get(url, params=params) as response:
                         if response.status >= 400:
                             text = await response.text()
@@ -154,22 +161,56 @@ class GazelleServiceAdapter(GazelleClient):
                                     retry_after=response.headers.get("Retry-After"),
                                 )
                                 if response.status == 429:
-                                    logger.get_logger().api_throttle(self.tracker.name.upper())
+                                    delay = self._record_throttle_and_delay(
+                                        attempt=attempt,
+                                        retry_after=response.headers.get("Retry-After"),
+                                        action=_action_name(params),
+                                    )
+                                    logger.get_logger().api_throttle(self.tracker.name.upper(), status="429")
+                                logger.get_logger().debug(
+                                    f"{self.tracker.name.upper()} attempt {attempt + 1}/{max_retries} "
+                                    f"failed: HTTP {response.status}; body: {text[:500]!r}"
+                                )
                                 logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
                                 await asyncio.sleep(delay)
                                 continue
+                            logger.get_logger().debug(
+                                f"{self.tracker.name.upper()} attempt {attempt + 1}/{max_retries} "
+                                f"failed with non-retryable HTTP {response.status}; body: {text[:500]!r}"
+                            )
                             raise exc
                         data = await parser(response)
+                        if _is_body_throttle(data):
+                            delay = self._record_throttle_and_delay(
+                                attempt=attempt,
+                                retry_after=response.headers.get("Retry-After"),
+                                action=_action_name(params),
+                            )
+                            logger.get_logger().api_throttle(self.tracker.name.upper(), status="body")
+                            logger.get_logger().debug(
+                                f"{self.tracker.name.upper()} attempt {attempt + 1}/{max_retries} "
+                                f"failed: HTTP 200 with rate-limit body: {data!r}"
+                            )
+                            if attempt < max_retries - 1:
+                                logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
+                                await asyncio.sleep(delay)
+                                continue
+                            raise GazelleThrottleResponse("Gazelle response body reported a rate limit")
+                        self._maybe_update_account_identity(data)
                         elapsed_ms = (time.time() - request_start) * 1000
                         return response.status, data, elapsed_ms
-                except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError):
+                except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError) as exc:
+                    logger.get_logger().debug(
+                        f"{self.tracker.name.upper()} attempt {attempt + 1}/{max_retries} "
+                        f"failed: {type(exc).__name__}: {exc or '(no message)'}"
+                    )
                     if attempt < max_retries - 1:
-                        delay = 2 ** (attempt + 1)
+                        delay = 2 ** (attempt + 3)  # starts at 8s, not 2s -- gentler on the tracker
                         logger.get_logger().api_retry(self.tracker.name.upper(), attempt + 1, max_retries, delay)
                         await asyncio.sleep(delay)
                     else:
                         logger.get_logger().api_failed(self.tracker.name.upper(), max_retries)
-                        raise
+                        raise logger.mark_reported(exc)
 
     def _retry_delay_seconds(self, *, attempt: int, status: int, retry_after: str | None) -> int:
         fallback_delay = 2 ** (attempt + 1)
@@ -182,11 +223,30 @@ class GazelleServiceAdapter(GazelleClient):
             return int(delay) if delay.is_integer() else int(delay) + 1
         return fallback_delay
 
-    async def _enforce_interval(self) -> None:
+    def _record_throttle_and_delay(
+        self,
+        *,
+        attempt: int,
+        retry_after: str | None,
+        action: str | None,
+    ) -> int:
+        delay = record_gazelle_throttle(
+            self.base_url,
+            self.tracker.name,
+            retry_after=retry_after,
+            fallback_delay=2 ** (attempt + 1),
+            action=action,
+            account_identity=self._account_identity,
+        )
+        return int(delay) if float(delay).is_integer() else int(delay) + 1
+
+    async def _enforce_interval(self, params: Dict[str, Any] | None = None) -> None:
         wait = await enforce_gazelle_min_interval(
             self.base_url,
             min_interval_seconds=self._min_interval_seconds,
             tracker_name=self.tracker.name,
+            action=_action_name(params or {}),
+            account_identity=self._account_identity,
         )
         log = logger.get_logger()
         log.api_wait_debug(self.tracker.name.upper(), wait)
@@ -211,6 +271,18 @@ class GazelleServiceAdapter(GazelleClient):
     def _get_headers(self) -> Dict[str, str]:
         auth = build_tracker_auth_header(self.tracker.name, self.tracker.api_key)
         return {"Authorization": auth, "User-Agent": DEFAULT_USER_AGENT}
+
+    def _maybe_update_account_identity(self, data: object) -> None:
+        if not isinstance(data, dict):
+            return
+        response = data.get("response")
+        if not isinstance(response, dict):
+            return
+        username = response.get("username")
+        uid = response.get("id")
+        if username is None or uid is None:
+            return
+        self._account_identity = spigot.account_identity(self.tracker.name, uid, str(username))
 
     def _map_result(self, result: Dict[str, Any]) -> GazelleSearchResult:
         group_id = (
@@ -241,3 +313,18 @@ class GazelleServiceAdapter(GazelleClient):
             self._session = None
         if session is not None and not session.closed:
             await session.close()
+
+
+def _action_name(params: Dict[str, Any]) -> str | None:
+    action = params.get("action")
+    return action.strip().lower() if isinstance(action, str) else None
+
+
+def _is_body_throttle(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    status = data.get("status")
+    if not isinstance(status, str) or status.strip().lower() != "failure":
+        return False
+    error = data.get("error")
+    return isinstance(error, str) and "rate limit" in error.strip().lower()

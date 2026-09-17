@@ -1,5 +1,7 @@
 """Compare media/encoding between matched editions (Stage 5)."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 

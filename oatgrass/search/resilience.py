@@ -57,6 +57,12 @@ def response_payload(payload: object, context: str) -> dict:
     return optional_dict(root, "response", context)
 
 
+def describe_exception(exc: Exception) -> str:
+    """`str(exc)`, falling back to the exception's class name for exceptions
+    (e.g. a bare asyncio.TimeoutError) that stringify to ""."""
+    return str(exc) or type(exc).__name__
+
+
 def is_retryable_exception(exc: Exception) -> bool:
     return (
         isinstance(exc, (asyncio.TimeoutError, ClientConnectionError, ServerTimeoutError))
@@ -77,7 +83,7 @@ async def run_with_retries(
         except Exception as exc:
             if attempt >= max_attempts or not is_retryable_exception(exc):
                 raise
-            delay = 2 ** attempt
+            delay = 2 ** (attempt + 2)  # starts at 8s, not 2s -- gentler on the tracker
             if on_retry is not None:
                 on_retry(attempt, max_attempts, delay, exc)
             await asyncio.sleep(delay)

@@ -1,5 +1,7 @@
 """Aggregate and prioritize upload candidates (Stage 6)."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List
 

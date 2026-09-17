@@ -1,5 +1,7 @@
 """Edition-aware search mode wrapper."""
 
+from __future__ import annotations
+
 from collections import Counter
 from typing import Optional
 
@@ -50,12 +52,14 @@ async def process_entry_edition_aware(
     source_client: GazelleServiceAdapter,
     target_client: GazelleServiceAdapter,
     emit_func,
-    
+    emit_warning_func,
+
     abbrev: bool,
-    verbose: bool,
     candidate_policy: CandidatePolicy = CandidatePolicy.STANDARD,
     show_context_line: bool = False,
     enrichment_cache: dict[int, dict] | None = None,
+    emit_result_candidate_func=None,
+    emit_result_duplicate_func=None,
 ) -> tuple[Optional[int], list[tuple[str, int]], list[str], PolicySummary]:
     """Process one entry with edition-aware search.
     
@@ -143,8 +147,8 @@ async def process_entry_edition_aware(
                 for c in policy_outcome.candidates
             ]
             if not abbrev:
-                emit_func(
-                    f"[yellow]No matching group found. {len(policy_outcome.candidates)} upload candidate(s).[/yellow]",
+                emit_warning_func(
+                    f"No matching group found. {len(policy_outcome.candidates)} upload candidate(s).",
                     indent=3,
                 )
             return None, urls_with_priority, suppression_messages, policy_outcome.summary
@@ -187,8 +191,8 @@ async def process_entry_edition_aware(
 
     _emit_task_context(target_group.group_id)
     
-    # Verbose mode: show detailed edition analysis
-    if verbose and not abbrev:
+    # Normal/debug mode: show detailed edition analysis (compact mode skips it)
+    if not abbrev:
         from oatgrass.search.edition_display import display_edition_matches
         from oatgrass.search.edition_comparison import display_edition_comparisons
 
@@ -207,23 +211,39 @@ async def process_entry_edition_aware(
             show_tracker_summary=not show_context_line,
         )
     elif not abbrev:
-        # In normal mode, show warning if any comparison has media mismatch
+        # NOTE: dead code, found (not fixed) while converting this file's
+        # [yellow] tags to explicit severity calls -- the preceding
+        # `if not abbrev:` already covers every case where this `elif`
+        # could be true, so this branch can never execute. Leaving the
+        # pre-existing logic as-is (out of scope for this pass) but
+        # flagging it: the media-mismatch warning below currently never
+        # fires in abbrev mode, and this looks unintentional.
         for comp in comparisons:
             if comp.has_warning():
-                emit_func("[yellow]⚠️  Warning: Matched editions with different media types (CD vs SACD). Verify carefully.[/yellow]", indent=3)
-    
+                emit_warning_func(
+                    "⚠️  Warning: Matched editions with different media types (CD vs SACD). Verify carefully.",
+                    indent=3,
+                )
+
     if policy_outcome.candidates:
         urls_with_priority = [
             (f"{source_tracker.url.rstrip('/')}/torrents.php?torrentid={c.source_torrent.torrent_id}", c.priority)
             for c in policy_outcome.candidates
         ]
         if not abbrev:
-            emit_func(
-                f"[yellow]Found match. Upload candidates: {_format_candidate_breakdown(policy_outcome.candidates)}.[/yellow]",
+            # A found upload candidate is a positive result, not a warning
+            # about the run -- gets the same [Result: candidate] vocabulary
+            # group_search.py uses for its own match verdicts.
+            (emit_result_candidate_func or emit_func)(
+                f"Found match. Upload candidates: {_format_candidate_breakdown(policy_outcome.candidates)}.",
                 indent=3,
             )
         return target_group.group_id, urls_with_priority, suppression_messages, policy_outcome.summary
-    
+
     if not abbrev:
-        emit_func(f"[cyan]Found match. No upload candidates (all editions/torrents match).[/cyan]", indent=3)
+        # Target already has every edition/torrent -- a duplicate verdict,
+        # not plain info.
+        (emit_result_duplicate_func or emit_func)(
+            "Found match. No upload candidates (all editions/torrents match).", indent=3
+        )
     return target_group.group_id, [], suppression_messages, policy_outcome.summary

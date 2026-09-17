@@ -31,6 +31,16 @@ def format_remaining(seconds: float) -> str:
     return f"{hours}h"
 
 
+def format_progress_bar(fraction: float, width: int = 25) -> str:
+    """Render a filled/empty bar, e.g. "[███∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙∙]".
+    `fraction` is clamped to [0, 1] -- callers pass whatever proportion is
+    known (pages done / total, wait elapsed / wait total); this only draws
+    it, it doesn't compute it."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    return "[" + ("█" * filled) + ("∙" * (width - filled)) + "]"
+
+
 def build_task_timing_phrase(
     total: int,
     completed: int,
